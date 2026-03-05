@@ -1,0 +1,29 @@
+# Crash dumps
+*.stackdump
+*.dmp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# SQLite
+*.db
+*.sqlite
+
+# Claude Code hook state
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
