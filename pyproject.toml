@@ -1,0 +1,49 @@
+# @decision DEC-PKG-001: hatchling build system, uv for dependency management
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "debacl"
+version = "0.1.0"
+description = "Dynamic Endpoint-Based Access Control List — security PoC"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2",
+    "sqlalchemy>=2",
+    "polars",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "typer",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "pytest-asyncio",
+]
+
+[project.scripts]
+debacl = "debacl.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/debacl"]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "B008",   # do not perform function calls in default arguments (common in FastAPI/Typer)
+    "SIM108", # ternary operator — too strict for PoC
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
