@@ -240,7 +240,7 @@ The PoC is done when: (1) all six collectors work in mock mode and produce canon
 | 2026-03-05 | DEC-COLLECT-001 | Phase 1 | BaseCollector ABC | Resolved: ABC contract enforced, Generic[T] typed |
 
 #### Phase 2: Collectors
-**Status:** planned
+**Status:** completed
 **Decision IDs:** DEC-COLLECT-001, DEC-TEST-001
 **Requirements:** REQ-P0-005, REQ-P0-006, REQ-P0-007, REQ-P0-008, REQ-P0-009, REQ-P0-010, REQ-P0-014
 **Issues:** W2-1 through W2-7 (see Work Items)
@@ -321,7 +321,11 @@ The PoC is done when: (1) all six collectors work in mock mode and produce canon
 - `tests/fixtures/` -- sample API responses and log files
 
 ##### Decision Log
-<!-- Guardian appends here after phase completion -->
+
+| Date | DEC-ID | Initiative | Decision | Rationale |
+|------|--------|-----------|----------|-----------|
+| 2026-03-05 | DEC-COLLECT-001 | Phase 2 | Strategy pattern collectors | Resolved: 6 adapters implemented (CrowdStrike, Intune, Jamf, Okta, Entra, VPN), all pass mock + HTTP-mock tests |
+| 2026-03-05 | DEC-TEST-001 | Phase 2 | Synthetic telemetry generator | Resolved: MockDataGenerator with configurable anomaly ratio, non-RFC1918 IPs, VPN log generation |
 
 #### Phase 3: Correlation Engine
 **Status:** planned
