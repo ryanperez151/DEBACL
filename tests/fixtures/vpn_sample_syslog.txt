@@ -1,0 +1,10 @@
+Mar  5 08:01:12 vpngw AnyConnect: Group <CORP-VPN> User <alice.smith@corp.com> IP <203.0.113.10> connected successfully
+Mar  5 08:02:44 vpngw AnyConnect: Group <CORP-VPN> User <bob.jones@corp.com> IP <198.51.100.20> connected successfully
+Mar  5 08:03:09 vpngw AnyConnect: Group <CORP-VPN> User <carol.williams@corp.com> IP <192.0.2.30> authentication failed
+Mar  5 08:04:55 vpngw GlobalProtect: user: dave.brown@corp.com src: 203.0.113.40 client-ip: 203.0.113.40 login success
+Mar  5 08:05:31 vpngw GlobalProtect: user: eve.taylor@corp.com src: 198.51.100.50 client-ip: 198.51.100.50 login success
+Mar  5 08:06:18 vpngw GlobalProtect: user: frank.davies@corp.com src: 192.0.2.60 client-ip: 192.0.2.60 authentication denied
+Mar  5 08:07:42 vpngw sslvpn: src=203.0.113.70 user=grace.wilson@corp.com action=connect status=success
+Mar  5 08:08:19 vpngw sslvpn: src=198.51.100.80 user=henry.evans@corp.com action=connect status=success
+Mar  5 08:09:03 vpngw sslvpn: src=192.0.2.90 user=iris.thomas@corp.com action=auth status=failed
+Mar  5 08:10:27 vpngw AnyConnect: Group <CORP-VPN> User <jack.roberts@corp.com> IP <203.0.113.100> connected successfully
