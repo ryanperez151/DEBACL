@@ -175,7 +175,7 @@ The PoC is done when: (1) all six collectors work in mock mode and produce canon
   Rationale: Real API calls in tests require credentials, network access, and stable external services. Synthetic data generators produce deterministic, edge-case-covering test fixtures. The same synthetic data mode doubles as the `--mock` flag for demos and evaluation.
 
 #### Phase 1: Foundation
-**Status:** planned
+**Status:** completed
 **Decision IDs:** DEC-PKG-001, DEC-MODEL-001, DEC-STORE-001
 **Requirements:** REQ-P0-001, REQ-P0-002, REQ-P0-003, REQ-P0-004, REQ-P0-013
 **Issues:** W1-1 through W1-4 (see Work Items)
@@ -231,7 +231,13 @@ The PoC is done when: (1) all six collectors work in mock mode and produce canon
 - `src/debacl/collectors/base.py` -- BaseCollector ABC defining adapter contract
 
 ##### Decision Log
-<!-- Guardian appends here after phase completion -->
+
+| Date | DEC-ID | Initiative | Decision | Rationale |
+|------|--------|-----------|----------|-----------|
+| 2026-03-05 | DEC-PKG-001 | Phase 1 | uv + ruff + pytest scaffold | Resolved: pyproject.toml created, uv sync verified |
+| 2026-03-05 | DEC-MODEL-001 | Phase 1 | Pydantic v2 canonical models | Resolved: EndpointTelemetry, ConnectionEvent, Finding all pass validation + round-trip |
+| 2026-03-05 | DEC-STORE-001 | Phase 1 | SQLite via SQLAlchemy 2.0 | Resolved: all 3 repos CRUD-verified with in-memory SQLite |
+| 2026-03-05 | DEC-COLLECT-001 | Phase 1 | BaseCollector ABC | Resolved: ABC contract enforced, Generic[T] typed |
 
 #### Phase 2: Collectors
 **Status:** planned
