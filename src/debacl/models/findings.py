@@ -25,7 +25,7 @@ class Finding(BaseModel):
     """An anomaly detected by the correlation engine."""
 
     finding_id: UUID = Field(default_factory=uuid4)
-    finding_type: Literal["unmanaged_ip", "ip_mismatch", "unknown_device"]
+    finding_type: Literal["unmanaged_ip", "ip_mismatch", "unknown_device", "info"]
     severity: Literal["critical", "high", "medium", "low", "info"]
     source_ip: IPv4Address | IPv6Address
     expected_ips: list[IPv4Address | IPv6Address]
