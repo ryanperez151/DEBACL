@@ -328,7 +328,7 @@ The PoC is done when: (1) all six collectors work in mock mode and produce canon
 | 2026-03-05 | DEC-TEST-001 | Phase 2 | Synthetic telemetry generator | Resolved: MockDataGenerator with configurable anomaly ratio, non-RFC1918 IPs, VPN log generation |
 
 #### Phase 3: Correlation Engine
-**Status:** planned
+**Status:** completed
 **Decision IDs:** DEC-CORR-001, DEC-DATA-001
 **Requirements:** REQ-P0-011, REQ-P1-004
 **Issues:** W3-1 through W3-3 (see Work Items)
@@ -378,7 +378,11 @@ The PoC is done when: (1) all six collectors work in mock mode and produce canon
 - `src/debacl/correlation/windowing.py` -- time-window filtering to reduce false positives
 
 ##### Decision Log
-<!-- Guardian appends here after phase completion -->
+
+| Date | DEC-ID | Initiative | Decision | Rationale |
+|------|--------|-----------|----------|-----------|
+| 2026-03-15 | DEC-CORR-001 | Phase 3 | Set-based IP correlation engine | Resolved: CorrelationEngine with ip_mismatch + unmanaged_ip detection, SeverityScorer with privilege escalation |
+| 2026-03-15 | DEC-DATA-001 | Phase 3 | Polars lazy frames for time-window filtering | Resolved: TimeWindowFilter filters stale telemetry/events before correlation |
 
 #### Phase 4: Output and Reporting
 **Status:** planned
