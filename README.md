@@ -54,3 +54,96 @@ In practice, this means the firewall or VPN gateway consults an automatically up
 
 Start small by simulating DEBACL using your existing data. For example, pull the list of managed endpoint IPs from your EDR or inventory database and compare it against recent VPN logins. Any successful VPN login from an IP not on your known-device list could be a red flag: it likely represents an unmanaged, unknown, or compromised machine that shouldn’t have access. Similarly, ensure all VPN authentication attempts are centrally logged so you can monitor who is getting blocked. This simple log analysis will highlight gaps – for instance, it might reveal old, unmanaged devices or home PCs using valid credentials. Those insights show exactly where DEBACL would pay off by denying those logins outright. Before you know it there may be opportunities to DEBACLFI (DEBACL for IdPs).
 In summary, DEBACL leverages the data you already have on endpoint health to dramatically shrink the VPN’s exposure. It’s like giving your VPN gateway a secret guest list that changes in real time – only “invited” (known-good) devices ever get through. Try overlaying a dynamic allow-list onto VPNs in monitor-mode and see which logins fall outside it. This exercise alone can uncover unmanaged or risky devices still getting in and makes a compelling case for moving toward a full DEBACL implementation.
+
+---
+
+## The PoC
+
+This repository contains a working Python proof-of-concept that operationalizes the DEBACL concept: ingest telemetry from EDR/MDM and IdP/VPN sources, correlate expected device IPs against observed connection IPs, and surface anomalies as structured findings.
+
+### Architecture
+
+```
+src/debacl/
+  models/       — Pydantic v2 canonical models (EndpointTelemetry, ConnectionEvent, Finding)
+  collectors/   — Pluggable adapters: CrowdStrike, Intune, Jamf, Okta, Entra ID, VPN logs
+  storage/      — SQLite persistence via SQLAlchemy (zero infrastructure required)
+  correlation/  — Set-based IP engine with configurable time-window filtering (Polars)
+  output/       — JSON, CSV, and SIEM JSON Lines exporters
+  cli/          — Typer CLI (collect, correlate, report, serve, status)
+  api/          — FastAPI REST surface with OpenAPI docs
+  config/       — Pydantic Settings with DEBACL_ env var overrides
+```
+
+### Quickstart
+
+**Requirements:** Python 3.11+, [uv](https://docs.astral.sh/uv/)
+
+```bash
+git clone https://github.com/ryanperez151/DEBACL.git
+cd DEBACL
+uv sync
+```
+
+**Run the full pipeline with synthetic data (no API credentials needed):**
+
+```bash
+# 1. Check current database state
+uv run debacl status
+
+# 2. Collect synthetic endpoint telemetry and connection events
+uv run debacl collect --all --mock
+
+# 3. Correlate expected IPs vs observed IPs — produces findings
+uv run debacl correlate --window 24
+
+# 4. Export findings
+uv run debacl report --format json --output output/
+uv run debacl report --format csv  --output output/
+
+# 5. (Optional) Start the REST API
+uv run debacl serve --port 8000
+# Then: GET http://localhost:8000/findings
+#       GET http://localhost:8000/docs  (OpenAPI UI)
+```
+
+### Supported Sources
+
+| Source | Type | Auth |
+|--------|------|------|
+| CrowdStrike Falcon | Endpoint telemetry | OAuth2 client credentials |
+| Microsoft Intune | Endpoint telemetry | MSAL / Azure AD app |
+| Jamf Pro | Endpoint telemetry | OAuth2 client credentials |
+| Okta | Auth/connection events | API token (SSWS) |
+| Microsoft Entra ID | Sign-in logs | MSAL / Azure AD app |
+| VPN logs | Connection events | CSV or syslog file |
+
+All sources support `--mock` mode for evaluation without credentials.
+
+### Configuration
+
+Copy `config.example.toml` and set credentials, or use environment variables with the `DEBACL_` prefix:
+
+```bash
+export DEBACL_CROWDSTRIKE_CLIENT_ID=your-id
+export DEBACL_CROWDSTRIKE_CLIENT_SECRET=your-secret
+export DEBACL_CORRELATION_WINDOW_HOURS=24
+```
+
+### Findings
+
+Findings are classified by type and severity:
+
+| Finding Type | Description | Severity |
+|---|---|---|
+| `unmanaged_ip` + privileged user + successful auth | Unknown IP, admin account connected | **critical** |
+| `unmanaged_ip` + successful auth | Unknown IP, connection succeeded | **high** |
+| `ip_mismatch` | Device IP differs from expected | **medium** |
+| `unmanaged_ip` + failed auth | Unknown IP, connection failed | **low** |
+
+### Running Tests
+
+```bash
+uv run pytest          # 309 tests across all modules
+uv run ruff check .    # linting
+```
