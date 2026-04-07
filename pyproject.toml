@@ -10,6 +10,7 @@ description = "Dynamic Endpoint-Based Access Control List — security PoC"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2",
+    "pydantic-settings>=2",
     "sqlalchemy>=2",
     "polars",
     "fastapi",

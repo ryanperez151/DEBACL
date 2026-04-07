@@ -1,0 +1,25 @@
+# DEBACL Configuration Example
+# Copy to config.toml and fill in credentials
+# All values can also be set via environment variables with DEBACL_ prefix
+
+[debacl]
+db_path = "debacl.db"
+correlation_window_hours = 24
+output_dir = "output"
+log_level = "INFO"
+
+[debacl.crowdstrike]
+enabled = false
+client_id = ""
+client_secret = ""
+
+[debacl.intune]
+enabled = false
+tenant_id = ""
+client_id = ""
+client_secret = ""
+
+[debacl.okta]
+enabled = false
+domain = "https://yourorg.okta.com"
+api_token = ""
