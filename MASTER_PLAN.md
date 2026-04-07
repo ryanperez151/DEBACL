@@ -57,7 +57,7 @@ tests/             -- pytest test suite mirroring src/ structure
 ## Active Initiatives
 
 ### Initiative: DEBACL PoC Build
-**Status:** active
+**Status:** completed
 **Started:** 2026-03-04
 **Goal:** Build a working proof-of-concept that ingests telemetry from multiple sources, correlates expected vs observed IPs, and produces actionable anomaly reports.
 
@@ -444,7 +444,7 @@ The PoC is done when: (1) all six collectors work in mock mode and produce canon
 | 2026-03-16 | DEC-PKG-001 | Phase 4 | Typer CLI | Resolved: 5 subcommands (collect, correlate, report, serve, status), entry point in pyproject.toml |
 
 #### Phase 5: Hardening and Integration Testing
-**Status:** planned
+**Status:** completed
 **Decision IDs:** DEC-TEST-001
 **Requirements:** REQ-P0-001 (coverage), REQ-P0-014
 **Issues:** W5-1 through W5-4 (see Work Items)
@@ -490,7 +490,12 @@ The PoC is done when: (1) all six collectors work in mock mode and produce canon
 - `config.example.toml` -- reference configuration file
 
 ##### Decision Log
-<!-- Guardian appends here after phase completion -->
+
+| Date | DEC-ID | Initiative | Decision | Rationale |
+|------|--------|-----------|----------|-----------|
+| 2026-03-16 | DEC-TEST-001 | Phase 5 | E2E pipeline test + synthetic scenarios | Resolved: full generate->store->correlate->export->API round-trip verified in test_e2e.py |
+| 2026-03-16 | DEC-PKG-001 | Phase 5 | pydantic-settings for config management | Resolved: DebacleSettings with DEBACL_ env prefix, .env file support, get_settings() cached factory |
+| 2026-03-16 | DEC-COLLECT-001 | Phase 5 | Structured exception hierarchy | Resolved: AuthenticationError, RateLimitError, DataError all subclass CollectorError |
 
 #### DEBACL PoC Build Worktree Strategy
 
@@ -519,6 +524,7 @@ Main is sacred. Each phase works in its own worktree:
 
 | Initiative | Period | Phases | Key Decisions | Archived |
 |-----------|--------|--------|---------------|----------|
+| DEBACL PoC Build | 2026-03-04 -> 2026-03-16 | Phases 1-5 | DEC-PKG-001, DEC-MODEL-001, DEC-STORE-001, DEC-COLLECT-001, DEC-CORR-001, DEC-DATA-001, DEC-TEST-001 | No |
 
 ---
 
