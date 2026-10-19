@@ -12,6 +12,9 @@ Okta collector — fetches authentication events with source IPs via Okta System
 
 from __future__ import annotations
 
+import logging
+from ipaddress import ip_address
+
 import httpx
 
 from debacl.collectors.base import BaseCollector, CollectorConfig
@@ -19,11 +22,13 @@ from debacl.collectors.exceptions import CollectorError
 from debacl.collectors.mock_data import MockDataGenerator
 from debacl.models.events import ConnectionEvent
 
+logger = logging.getLogger(__name__)
+
 
 class OktaConfig(CollectorConfig):
     """Configuration for the Okta System Log collector."""
 
-    domain: str = ""       # e.g. "https://yourorg.okta.com"
+    domain: str = ""  # e.g. "https://yourorg.okta.com"
     api_token: str = ""
 
 
@@ -54,6 +59,7 @@ class OktaCollector(BaseCollector[ConnectionEvent]):
     def __init__(self, config: OktaConfig) -> None:
         super().__init__(config)
         self.config: OktaConfig = config
+        self.skipped_count = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -69,8 +75,7 @@ class OktaCollector(BaseCollector[ConnectionEvent]):
         """Page through /api/v1/logs following Link rel=next headers."""
         events: list[dict] = []
         url: str | None = (
-            f"{self.config.domain}/api/v1/logs"
-            '?filter=eventType+eq+"user.session.start"&limit=1000'
+            f'{self.config.domain}/api/v1/logs?filter=eventType+eq+"user.session.start"&limit=1000'
         )
         headers = self._headers()
 
@@ -80,7 +85,13 @@ class OktaCollector(BaseCollector[ConnectionEvent]):
                 raise CollectorError(
                     f"Okta System Log request failed: {resp.status_code} {resp.text}"
                 )
-            events.extend(resp.json())
+            try:
+                page = resp.json()
+            except ValueError:
+                raise CollectorError("Okta System Log returned invalid JSON") from None
+            if not isinstance(page, list):
+                raise CollectorError("Okta System Log returned invalid event data")
+            events.extend(page)
             url = self._next_link(resp.headers.get("Link", ""))
 
         return events
@@ -97,18 +108,40 @@ class OktaCollector(BaseCollector[ConnectionEvent]):
 
     def _normalize(self, raw: dict) -> ConnectionEvent | None:
         """Convert a raw Okta log event to a ConnectionEvent."""
-        client_ip = raw.get("client", {}).get("ipAddress")
-        username = raw.get("actor", {}).get("alternateId", "")
-        outcome_result = raw.get("outcome", {}).get("result", "UNKNOWN").upper()
-        event_type = self._OUTCOME_MAP.get(outcome_result, "auth_failure")
+        if not isinstance(raw, dict):
+            raise CollectorError("Okta normalization error: invalid event record")
+        client = raw.get("client") or {}
+        actor = raw.get("actor") or {}
+        if not isinstance(client, dict) or not isinstance(actor, dict):
+            raise CollectorError("Okta normalization error: invalid event record")
+        client_ip = client.get("ipAddress")
+        username = actor.get("alternateId", "")
         published = raw.get("published", "")
 
-        if not client_ip or not username or not published:
+        if any(
+            value is None or (isinstance(value, str) and not value.strip())
+            for value in (client_ip, username, published)
+        ):
             return None
 
+        if not isinstance(client_ip, str):
+            raise CollectorError("Okta normalization error: invalid client.ipAddress")
+        try:
+            parsed_ip = ip_address(client_ip.strip())
+        except ValueError:
+            raise CollectorError("Okta normalization error: invalid client.ipAddress") from None
+
+        outcome = raw.get("outcome") or {}
+        if not isinstance(outcome, dict):
+            raise CollectorError("Okta normalization error: invalid event record")
+        outcome_result = outcome.get("result", "UNKNOWN")
+        if not isinstance(outcome_result, str):
+            raise CollectorError("Okta normalization error: invalid event record")
+        outcome_result = outcome_result.upper()
+        event_type = self._OUTCOME_MAP.get(outcome_result, "auth_failure")
         try:
             return ConnectionEvent(
-                source_ip=client_ip,
+                source_ip=parsed_ip,
                 username=username,
                 destination=self.config.domain or "okta",
                 event_type=event_type,
@@ -116,8 +149,8 @@ class OktaCollector(BaseCollector[ConnectionEvent]):
                 source="okta",
                 raw_data=raw,
             )
-        except Exception as exc:
-            raise CollectorError(f"Okta normalization error: {exc}") from exc
+        except Exception:
+            raise CollectorError("Okta normalization error: invalid event record") from None
 
     # ------------------------------------------------------------------
     # BaseCollector interface
@@ -128,6 +161,7 @@ class OktaCollector(BaseCollector[ConnectionEvent]):
 
         Uses MockDataGenerator when config.mock_mode is True.
         """
+        self.skipped_count = 0
         if self.config.mock_mode:
             return MockDataGenerator().generate_connection_events("okta")
 
@@ -139,7 +173,17 @@ class OktaCollector(BaseCollector[ConnectionEvent]):
 
         results: list[ConnectionEvent] = []
         for raw in raw_events:
-            record = self._normalize(raw)
+            try:
+                record = self._normalize(raw)
+            except CollectorError:
+                self.skipped_count += 1
+                continue
             if record is not None:
                 results.append(record)
+            else:
+                self.skipped_count += 1
+        if self.skipped_count:
+            logger.warning(
+                "Okta skipped %d event(s) with missing or invalid data", self.skipped_count
+            )
         return results

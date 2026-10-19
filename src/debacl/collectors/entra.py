@@ -14,12 +14,17 @@ Microsoft Entra ID collector — fetches sign-in logs via Microsoft Graph API.
 
 from __future__ import annotations
 
+import logging
+from ipaddress import ip_address
+
 import httpx
 
 from debacl.collectors.base import BaseCollector, CollectorConfig
 from debacl.collectors.exceptions import CollectorError
 from debacl.collectors.mock_data import MockDataGenerator
 from debacl.models.events import ConnectionEvent
+
+logger = logging.getLogger(__name__)
 
 
 class EntraConfig(CollectorConfig):
@@ -49,6 +54,7 @@ class EntraCollector(BaseCollector[ConnectionEvent]):
     def __init__(self, config: EntraConfig) -> None:
         super().__init__(config)
         self.config: EntraConfig = config
+        self.skipped_count = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -56,10 +62,7 @@ class EntraCollector(BaseCollector[ConnectionEvent]):
 
     def _get_token(self, client: httpx.Client) -> str:
         """Obtain a Bearer token via MSAL client credentials flow."""
-        token_url = (
-            f"https://login.microsoftonline.com/{self.config.tenant_id}"
-            "/oauth2/v2.0/token"
-        )
+        token_url = f"https://login.microsoftonline.com/{self.config.tenant_id}/oauth2/v2.0/token"
         resp = client.post(
             token_url,
             data={
@@ -70,9 +73,7 @@ class EntraCollector(BaseCollector[ConnectionEvent]):
             },
         )
         if resp.status_code != 200:
-            raise CollectorError(
-                f"Entra MSAL token request failed: {resp.status_code} {resp.text}"
-            )
+            raise CollectorError(f"Entra MSAL token request failed: {resp.status_code} {resp.text}")
         return resp.json()["access_token"]
 
     def _fetch_sign_ins(self, client: httpx.Client, token: str) -> list[dict]:
@@ -87,28 +88,50 @@ class EntraCollector(BaseCollector[ConnectionEvent]):
                 raise CollectorError(
                     f"Entra sign-in log request failed: {resp.status_code} {resp.text}"
                 )
-            body = resp.json()
-            sign_ins.extend(body.get("value", []))
-            url = body.get("@odata.nextLink")
+            try:
+                body = resp.json()
+            except ValueError:
+                raise CollectorError("Entra sign-in log returned invalid JSON") from None
+            if not isinstance(body, dict) or not isinstance(body.get("value"), list):
+                raise CollectorError("Entra sign-in log returned invalid event data")
+            next_link = body.get("@odata.nextLink")
+            if next_link is not None and not isinstance(next_link, str):
+                raise CollectorError("Entra sign-in log returned invalid pagination data")
+            sign_ins.extend(body["value"])
+            url = next_link
 
         return sign_ins
 
     @staticmethod
     def _normalize(raw: dict) -> ConnectionEvent | None:
         """Convert a raw Graph signIn record to a ConnectionEvent."""
+        if not isinstance(raw, dict):
+            raise CollectorError("Entra normalization error: invalid sign-in record")
         ip = raw.get("ipAddress")
         username = raw.get("userPrincipalName", "")
-        status = raw.get("status", {})
-        error_code = status.get("errorCode", -1)
-        event_type = "auth_success" if error_code == 0 else "auth_failure"
         created_at = raw.get("createdDateTime", "")
 
-        if not ip or not username or not created_at:
+        if any(
+            value is None or (isinstance(value, str) and not value.strip())
+            for value in (ip, username, created_at)
+        ):
             return None
 
+        if not isinstance(ip, str):
+            raise CollectorError("Entra normalization error: invalid ipAddress")
+        try:
+            parsed_ip = ip_address(ip.strip())
+        except ValueError:
+            raise CollectorError("Entra normalization error: invalid ipAddress") from None
+
+        status = raw.get("status") or {}
+        if not isinstance(status, dict):
+            raise CollectorError("Entra normalization error: invalid sign-in record")
+        error_code = status.get("errorCode", -1)
+        event_type = "auth_success" if error_code == 0 else "auth_failure"
         try:
             return ConnectionEvent(
-                source_ip=ip,
+                source_ip=parsed_ip,
                 username=username,
                 destination="entra",
                 event_type=event_type,
@@ -116,8 +139,8 @@ class EntraCollector(BaseCollector[ConnectionEvent]):
                 source="entra",
                 raw_data=raw,
             )
-        except Exception as exc:
-            raise CollectorError(f"Entra normalization error: {exc}") from exc
+        except Exception:
+            raise CollectorError("Entra normalization error: invalid sign-in record") from None
 
     # ------------------------------------------------------------------
     # BaseCollector interface
@@ -128,6 +151,7 @@ class EntraCollector(BaseCollector[ConnectionEvent]):
 
         Uses MockDataGenerator when config.mock_mode is True.
         """
+        self.skipped_count = 0
         if self.config.mock_mode:
             return MockDataGenerator().generate_connection_events("entra")
 
@@ -140,7 +164,17 @@ class EntraCollector(BaseCollector[ConnectionEvent]):
 
         results: list[ConnectionEvent] = []
         for raw in raw_sign_ins:
-            record = self._normalize(raw)
+            try:
+                record = self._normalize(raw)
+            except CollectorError:
+                self.skipped_count += 1
+                continue
             if record is not None:
                 results.append(record)
+            else:
+                self.skipped_count += 1
+        if self.skipped_count:
+            logger.warning(
+                "Entra skipped %d sign-in(s) with missing or invalid data", self.skipped_count
+            )
         return results

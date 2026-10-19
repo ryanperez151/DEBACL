@@ -27,15 +27,119 @@ app = typer.Typer(
 # ---------------------------------------------------------------------------
 
 _SEVERITY_LEVELS = {"critical", "high", "medium", "low", "info"}
+_ENDPOINT_SOURCES = ("crowdstrike", "intune", "jamf")
+_EVENT_SOURCES = ("okta", "entra", "vpn_log")
+_SOURCES = _ENDPOINT_SOURCES + _EVENT_SOURCES
+
+
+class _ConfigurationError(Exception):
+    """A source cannot run with the selected local configuration."""
 
 
 def _get_engine():
     """Return the default SQLite engine, initialising tables if needed."""
+    from debacl.config import get_settings
     from debacl.storage.database import get_engine, init_db
 
-    engine = get_engine("sqlite:///debacl.db")
+    engine = get_engine(f"sqlite:///{get_settings().db_path}")
     init_db(engine)
     return engine
+
+
+def _require_live_settings(source: str, settings, *fields: str) -> None:
+    missing = [f"DEBACL_{field.upper()}" for field in fields if not getattr(settings, field)]
+    if missing:
+        raise _ConfigurationError(f"{source} requires {', '.join(missing)} in live mode")
+
+
+def _make_collector(source: str, settings, mock: bool):
+    """Build an existing source adapter without touching a provider API."""
+    common = {"source": source, "mock_mode": mock}
+
+    if source == "crowdstrike":
+        from debacl.collectors.crowdstrike import CrowdStrikeCollector, CrowdStrikeConfig
+
+        if not mock:
+            _require_live_settings(
+                source, settings, "crowdstrike_client_id", "crowdstrike_client_secret"
+            )
+        return CrowdStrikeCollector(
+            CrowdStrikeConfig(
+                **common,
+                client_id=settings.crowdstrike_client_id,
+                client_secret=settings.crowdstrike_client_secret,
+            )
+        )
+    if source == "intune":
+        from debacl.collectors.intune import IntuneCollector, IntuneConfig
+
+        if not mock:
+            _require_live_settings(
+                source, settings, "azure_tenant_id", "azure_client_id", "azure_client_secret"
+            )
+        return IntuneCollector(
+            IntuneConfig(
+                **common,
+                tenant_id=settings.azure_tenant_id,
+                client_id=settings.azure_client_id,
+                client_secret=settings.azure_client_secret,
+            )
+        )
+    if source == "jamf":
+        from debacl.collectors.jamf import JamfCollector, JamfConfig
+
+        if not mock:
+            _require_live_settings(
+                source, settings, "jamf_base_url", "jamf_client_id", "jamf_client_secret"
+            )
+        return JamfCollector(
+            JamfConfig(
+                **common,
+                base_url=settings.jamf_base_url,
+                client_id=settings.jamf_client_id,
+                client_secret=settings.jamf_client_secret,
+            )
+        )
+    if source == "okta":
+        from debacl.collectors.okta import OktaCollector, OktaConfig
+
+        if not mock:
+            _require_live_settings(source, settings, "okta_domain", "okta_api_token")
+        return OktaCollector(
+            OktaConfig(
+                **common,
+                domain=settings.okta_domain,
+                api_token=settings.okta_api_token,
+            )
+        )
+    if source == "entra":
+        from debacl.collectors.entra import EntraCollector, EntraConfig
+
+        if not mock:
+            _require_live_settings(
+                source, settings, "azure_tenant_id", "azure_client_id", "azure_client_secret"
+            )
+        return EntraCollector(
+            EntraConfig(
+                **common,
+                tenant_id=settings.azure_tenant_id,
+                client_id=settings.azure_client_id,
+                client_secret=settings.azure_client_secret,
+            )
+        )
+    if source == "vpn_log":
+        from debacl.collectors.vpn_log import VpnLogCollector, VpnLogConfig
+
+        if not mock:
+            _require_live_settings(source, settings, "vpn_log_path")
+        return VpnLogCollector(
+            VpnLogConfig(
+                **common,
+                log_path=settings.vpn_log_path,
+                log_format=settings.vpn_log_format,
+            )
+        )
+    raise _ConfigurationError(f"Unknown source {source!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -66,26 +170,85 @@ def collect(
     ] = True,
 ) -> None:
     """Collect endpoint telemetry or connection events from configured sources."""
-    try:
-        from debacl.collectors.crowdstrike import CrowdStrikeCollector  # noqa: F401
-    except ImportError as exc:
-        typer.echo("Collectors not available in this build.", err=True)
-        raise typer.Exit(1) from exc
+    from debacl.config import get_settings
+    from debacl.models.events import ConnectionEvent
+    from debacl.models.telemetry import EndpointTelemetry
+    from debacl.storage.repository import EventRepository, TelemetryRepository
 
-    sources_to_collect: list[str] = []
-    if all_sources:
-        sources_to_collect = ["crowdstrike", "intune", "jamf", "okta", "entra", "vpn_log"]
-    elif source:
-        sources_to_collect = [source]
-    else:
-        typer.echo("Specify --source <name> or --all.", err=True)
+    if all_sources == bool(source):
+        if all_sources:
+            typer.echo("Use either --source or --all, not both.", err=True)
+        else:
+            typer.echo("Specify --source <name> or --all.", err=True)
+        raise typer.Exit(1)
+    if source is not None and source not in _SOURCES:
+        typer.echo(f"Unknown source {source!r}. Use: {', '.join(_SOURCES)}.", err=True)
         raise typer.Exit(1)
 
+    settings = get_settings()
+    if all_sources:
+        # Mock runs exercise all adapters; live runs only use enabled sources.
+        sources_to_collect = [
+            src for src in _SOURCES if mock or getattr(settings, f"{src}_enabled")
+        ]
+    else:
+        sources_to_collect = [source]
+    if not sources_to_collect:
+        typer.echo("No sources are enabled. Set DEBACL_<SOURCE>_ENABLED or use --source.", err=True)
+        raise typer.Exit(1)
+
+    try:
+        engine = _get_engine() if save else None
+    except Exception as exc:
+        typer.echo(f"Could not open collection database ({type(exc).__name__}).", err=True)
+        raise typer.Exit(1) from None
+
+    t_repo = TelemetryRepository(engine) if engine is not None else None
+    e_repo = EventRepository(engine) if engine is not None else None
+    failed = False
     for src in sources_to_collect:
         typer.echo(f"Collecting from {src} (mock={mock}) ...")
-        # Collectors from Phase 2 — each has its own import path.
-        # The exact invocation depends on the collector API not yet merged.
-        typer.echo(f"  Collected 0 items from {src} (placeholder — Phase 2 not merged)")
+        try:
+            collector = _make_collector(src, settings, mock)
+            records = collector.collect()
+            expected = EndpointTelemetry if src in _ENDPOINT_SOURCES else ConnectionEvent
+            if not isinstance(records, list) or any(
+                not isinstance(record, expected) or record.source != src for record in records
+            ):
+                raise TypeError("Collector returned unexpected canonical records")
+            skipped = getattr(collector, "skipped_count", 0)
+            if not isinstance(skipped, int) or skipped < 0:
+                raise TypeError("Collector returned an invalid skipped count")
+
+            if t_repo is not None and src in _ENDPOINT_SOURCES:
+                persisted = t_repo.save_many(records)
+            elif e_repo is not None:
+                persisted = e_repo.save_many(records)
+            else:
+                persisted = 0
+
+            summary = f"  Collected {len(records)} items from {src}"
+            if save:
+                summary += f"; persisted {persisted}; already present {len(records) - persisted}"
+            else:
+                summary += "; not saved"
+            summary += f"; skipped {skipped} invalid/incomplete source records"
+            typer.echo(summary)
+            if not records:
+                typer.echo(f"  No usable records returned by {src}.", err=True)
+            if skipped:
+                failed = True
+        except _ConfigurationError as exc:
+            typer.echo(f"  {exc}", err=True)
+            failed = True
+        except Exception as exc:
+            # Provider errors may contain response bodies or credentials. Never
+            # echo their text, and always mark this source/command as failed.
+            typer.echo(f"  Collection failed for {src} ({type(exc).__name__}).", err=True)
+            failed = True
+
+    if failed:
+        raise typer.Exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +275,7 @@ def correlate(
     from datetime import datetime
 
     from debacl.correlation.engine import CorrelationConfig, CorrelationEngine
+    from debacl.normalization import as_utc
     from debacl.storage.repository import EventRepository, FindingRepository, TelemetryRepository
 
     engine = _get_engine()
@@ -123,10 +287,9 @@ def correlate(
     events = e_repo.get_all()
 
     if since is not None:
-        cutoff = datetime.fromisoformat(since)
-        naive_cutoff = cutoff.replace(tzinfo=None)
-        telemetry = [t for t in telemetry if t.timestamp.replace(tzinfo=None) >= naive_cutoff]
-        events = [e for e in events if e.timestamp.replace(tzinfo=None) >= naive_cutoff]
+        cutoff = as_utc(datetime.fromisoformat(since))
+        telemetry = [t for t in telemetry if as_utc(t.timestamp) >= cutoff]
+        events = [e for e in events if as_utc(e.timestamp) >= cutoff]
 
     config = CorrelationConfig(time_window_hours=window)
     corr_engine = CorrelationEngine(config=config)
@@ -144,9 +307,7 @@ def correlate(
     typer.echo(f"\n{'Finding ID':<38} {'Type':<18} {'Severity':<10} {'Source IP'}")
     typer.echo("-" * 90)
     for f in findings:
-        typer.echo(
-            f"{str(f.finding_id):<38} {f.finding_type:<18} {f.severity:<10} {f.source_ip}"
-        )
+        typer.echo(f"{str(f.finding_id):<38} {f.finding_type:<18} {f.severity:<10} {f.source_ip}")
     typer.echo(f"\nTotal findings: {len(findings)}")
 
 

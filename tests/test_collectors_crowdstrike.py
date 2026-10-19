@@ -22,6 +22,7 @@ from debacl.models.telemetry import EndpointTelemetry
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _make_config(**kwargs) -> CrowdStrikeConfig:
     return CrowdStrikeConfig(
         source="crowdstrike",
@@ -67,6 +68,7 @@ _DEVICE_DETAILS_RESP = {
 # Mock-mode tests
 # ---------------------------------------------------------------------------
 
+
 class TestCrowdStrikeMockMode:
     def test_mock_mode_returns_list(self):
         collector = CrowdStrikeCollector(_make_config(mock_mode=True))
@@ -88,10 +90,17 @@ class TestCrowdStrikeMockMode:
         result = collector.collect()
         assert len(result) > 0
 
+    def test_mock_mode_resets_skip_count(self):
+        collector = CrowdStrikeCollector(_make_config(mock_mode=True))
+        collector.skipped_count = 7
+        collector.collect()
+        assert collector.skipped_count == 0
+
 
 # ---------------------------------------------------------------------------
 # Live-mode normalization tests (HTTP mocked)
 # ---------------------------------------------------------------------------
+
 
 class TestCrowdStrikeLiveMode:
     def test_normalization_correct(self, httpx_mock: HTTPXMock):
@@ -122,7 +131,7 @@ class TestCrowdStrikeLiveMode:
         assert result[0].source == "crowdstrike"
         assert result[0].hostname == "CORP-LAPTOP-001"
 
-    def test_normalization_skips_missing_external_ip(self, httpx_mock: HTTPXMock):
+    def test_normalization_skips_missing_external_ip(self, httpx_mock: HTTPXMock, caplog):
         details_no_ip = {
             "resources": [
                 {
@@ -153,6 +162,108 @@ class TestCrowdStrikeLiveMode:
         collector = CrowdStrikeCollector(_make_config(mock_mode=False))
         result = collector.collect()
         assert result == []
+        assert collector.skipped_count == 1
+        warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+        assert warnings == ["CrowdStrike skipped 1 invalid or incomplete device record(s)"]
+        assert "device-003" not in warnings[0]
+
+    def test_mixed_missing_invalid_and_valid_records_warn_once(self, httpx_mock: HTTPXMock, caplog):
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/oauth2/token",
+            json=_TOKEN_RESP,
+            status_code=201,
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url="https://api.crowdstrike.com/devices/queries/devices/v1?limit=500&offset=0",
+            json={
+                "resources": ["device-1", "device-2", "device-3", "device-4"],
+                "meta": {"pagination": {"total": 4}},
+            },
+        )
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/devices/entities/devices/v2",
+            json={
+                "resources": [
+                    {"device_id": "device-1", "external_ip": None},
+                    {"device_id": "device-2", "external_ip": "  "},
+                    {"device_id": "device-4", "external_ip": "aa:bb:cc:dd:ee:ff"},
+                    {
+                        "device_id": "device-3",
+                        "external_ip": "2001:db8::4",
+                        "last_seen": "2026-03-05T08:00:00Z",
+                    },
+                ]
+            },
+        )
+
+        collector = CrowdStrikeCollector(_make_config(mock_mode=False))
+        result = collector.collect()
+
+        assert collector.skipped_count == 3
+        assert len(result) == 1
+        assert str(result[0].public_ip) == "2001:db8::4"
+        warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+        assert warnings == ["CrowdStrike skipped 3 invalid or incomplete device record(s)"]
+        assert "device-4" not in warnings[0]
+        assert "aa:bb:cc:dd:ee:ff" not in warnings[0]
+
+    @pytest.mark.parametrize("bad_ip", ["aa:bb:cc:dd:ee:ff", 123])
+    def test_present_invalid_ip_raises_sanitized_error(self, bad_ip):
+        with pytest.raises(CollectorError, match="invalid external_ip") as exc:
+            CrowdStrikeCollector._normalize({"external_ip": bad_ip, "device_id": "secret-id"})
+        assert str(bad_ip) not in str(exc.value)
+        assert "secret-id" not in str(exc.value)
+
+    @pytest.mark.parametrize("missing_id", [None, "", "  "])
+    def test_detail_without_device_id_is_skipped_not_trusted(
+        self, httpx_mock: HTTPXMock, caplog, missing_id
+    ):
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/oauth2/token",
+            json=_TOKEN_RESP,
+            status_code=201,
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url="https://api.crowdstrike.com/devices/queries/devices/v1?limit=500&offset=0",
+            json={
+                "resources": ["device-valid", "device-incomplete"],
+                "meta": {"pagination": {"total": 2}},
+            },
+        )
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/devices/entities/devices/v2",
+            json={
+                "resources": [
+                    {
+                        "device_id": "device-valid",
+                        "external_ip": "203.0.113.10",
+                        "last_seen": "2026-03-05T08:00:00Z",
+                    },
+                    {
+                        "device_id": missing_id,
+                        "external_ip": "198.51.100.20",
+                        "last_seen": "2026-03-05T08:00:00Z",
+                    },
+                ]
+            },
+        )
+
+        collector = CrowdStrikeCollector(_make_config(mock_mode=False))
+        result = collector.collect()
+
+        assert collector.skipped_count == 1
+        assert [(r.device_id, str(r.public_ip)) for r in result] == [
+            ("device-valid", "203.0.113.10")
+        ]
+        warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+        assert warnings == ["CrowdStrike skipped 1 invalid or incomplete device record(s)"]
+        assert "198.51.100.20" not in warnings[0]
 
     def test_token_failure_raises_collector_error(self, httpx_mock: HTTPXMock):
         httpx_mock.add_response(
@@ -182,6 +293,139 @@ class TestCrowdStrikeLiveMode:
         with pytest.raises(CollectorError, match="device query"):
             collector.collect()
 
+    @pytest.mark.parametrize("payload", [{}, {"resources": {}}, {"resources": None}])
+    def test_malformed_device_query_is_fatal(self, httpx_mock: HTTPXMock, payload):
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/oauth2/token",
+            json=_TOKEN_RESP,
+            status_code=201,
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url="https://api.crowdstrike.com/devices/queries/devices/v1?limit=500&offset=0",
+            json=payload,
+        )
+
+        collector = CrowdStrikeCollector(_make_config(mock_mode=False))
+        with pytest.raises(CollectorError, match="invalid resources"):
+            collector.collect()
+
+    def test_query_missing_declared_total_is_fatal(self, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/oauth2/token",
+            json=_TOKEN_RESP,
+            status_code=201,
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url="https://api.crowdstrike.com/devices/queries/devices/v1?limit=500&offset=0",
+            json={"resources": [], "meta": {"pagination": {}}},
+        )
+
+        collector = CrowdStrikeCollector(_make_config(mock_mode=False))
+        with pytest.raises(CollectorError, match="invalid pagination"):
+            collector.collect()
+
+    @pytest.mark.parametrize(
+        "second_page,reason",
+        [
+            ({"resources": [], "meta": {"pagination": {"total": 2}}}, "incomplete"),
+            ({"resources": ["device-002"], "meta": {"pagination": {"total": 3}}}, "inconsistent"),
+        ],
+    )
+    def test_query_declared_total_mismatch_is_fatal(
+        self, httpx_mock: HTTPXMock, second_page, reason
+    ):
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/oauth2/token",
+            json=_TOKEN_RESP,
+            status_code=201,
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url="https://api.crowdstrike.com/devices/queries/devices/v1?limit=500&offset=0",
+            json={"resources": ["device-001"], "meta": {"pagination": {"total": 2}}},
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url="https://api.crowdstrike.com/devices/queries/devices/v1?limit=500&offset=1",
+            json=second_page,
+        )
+
+        collector = CrowdStrikeCollector(_make_config(mock_mode=False))
+        with pytest.raises(CollectorError, match=reason):
+            collector.collect()
+
+    @pytest.mark.parametrize("payload", [{}, {"resources": {}}, {"resources": []}])
+    def test_malformed_or_incomplete_details_are_fatal(self, httpx_mock: HTTPXMock, payload):
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/oauth2/token",
+            json=_TOKEN_RESP,
+            status_code=201,
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url="https://api.crowdstrike.com/devices/queries/devices/v1?limit=500&offset=0",
+            json={"resources": ["device-001"], "meta": {"pagination": {"total": 1}}},
+        )
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/devices/entities/devices/v2",
+            json=payload,
+        )
+
+        collector = CrowdStrikeCollector(_make_config(mock_mode=False))
+        with pytest.raises(CollectorError, match="invalid resources|incomplete"):
+            collector.collect()
+
+    def test_details_missing_one_queried_id_are_fatal(self, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/oauth2/token",
+            json=_TOKEN_RESP,
+            status_code=201,
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url="https://api.crowdstrike.com/devices/queries/devices/v1?limit=500&offset=0",
+            json=_DEVICE_IDS_RESP,
+        )
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/devices/entities/devices/v2",
+            json={"resources": [_DEVICE_DETAILS_RESP["resources"][0]]},
+        )
+
+        collector = CrowdStrikeCollector(_make_config(mock_mode=False))
+        with pytest.raises(CollectorError, match="incomplete"):
+            collector.collect()
+
+    def test_details_with_unqueried_id_are_fatal(self, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/oauth2/token",
+            json=_TOKEN_RESP,
+            status_code=201,
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url="https://api.crowdstrike.com/devices/queries/devices/v1?limit=500&offset=0",
+            json={"resources": ["device-001"], "meta": {"pagination": {"total": 1}}},
+        )
+        httpx_mock.add_response(
+            method="POST",
+            url="https://api.crowdstrike.com/devices/entities/devices/v2",
+            json={"resources": [{"device_id": "unexpected", "external_ip": "203.0.113.10"}]},
+        )
+
+        collector = CrowdStrikeCollector(_make_config(mock_mode=False))
+        with pytest.raises(CollectorError, match="incomplete"):
+            collector.collect()
+
     def test_empty_device_list_returns_empty(self, httpx_mock: HTTPXMock):
         httpx_mock.add_response(
             method="POST",
@@ -195,5 +439,7 @@ class TestCrowdStrikeLiveMode:
             json={"resources": [], "meta": {"pagination": {"total": 0}}},
         )
         collector = CrowdStrikeCollector(_make_config(mock_mode=False))
+        collector.skipped_count = 7
         result = collector.collect()
         assert result == []
+        assert collector.skipped_count == 0

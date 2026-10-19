@@ -11,6 +11,7 @@ Repository classes — bridge between Pydantic models and SQLAlchemy records.
            to avoid a complex join schema at the PoC stage.
 """
 
+import json
 from datetime import datetime
 from ipaddress import ip_address
 
@@ -19,9 +20,59 @@ from sqlalchemy import Engine
 from debacl.models.events import ConnectionEvent
 from debacl.models.findings import Finding
 from debacl.models.telemetry import EndpointTelemetry
+from debacl.normalization import as_utc
 
 from .database import get_session
 from .tables import ConnectionEventRecord, EndpointTelemetryRecord, FindingRecord
+
+
+def _utc_naive(timestamp: datetime) -> datetime:
+    """Convert a timestamp to the UTC-naive form stored by SQLite."""
+    return as_utc(timestamp).replace(tzinfo=None)
+
+
+def _utc_aware(timestamp: datetime) -> datetime:
+    """Treat legacy naive database timestamps as UTC on read."""
+    return as_utc(timestamp)
+
+
+def _telemetry_key(row: EndpointTelemetryRecord) -> tuple:
+    """Observation identity available in the current telemetry schema."""
+    return (
+        row.source,
+        row.device_id,
+        row.hostname,
+        row.public_ip,
+        row.timestamp,
+        row.health_status,
+        row.raw_data_json,
+    )
+
+
+def _event_key(row: ConnectionEventRecord) -> tuple | None:
+    """Deduplicate only events carrying stable source provenance.
+
+    Equal normalized fields and timestamps do not prove two authentication
+    events are the same event. An absent raw payload supplies no identity.
+    """
+    if row.raw_data_json is None:
+        return None
+    provenance = json.loads(row.raw_data_json)
+    stable_log_line = (
+        row.source == "vpn_log"
+        and provenance.get("timestamp_basis") == "collection_time"
+        and {"file_path", "line_number", "record_sha256"}.issubset(provenance)
+    )
+    return (
+        row.source,
+        row.source_ip,
+        row.username,
+        row.destination,
+        row.event_type,
+        None if stable_log_line else row.timestamp,
+        row.raw_data_json,
+    )
+
 
 # ---------------------------------------------------------------------------
 # TelemetryRepository
@@ -43,8 +94,11 @@ class TelemetryRepository:
             hostname=t.hostname,
             public_ip=str(t.public_ip),
             source=t.source,
-            timestamp=t.timestamp.replace(tzinfo=None),  # SQLite stores naive datetimes
+            timestamp=_utc_naive(t.timestamp),
             health_status=t.health_status,
+            raw_data_json=json.dumps(t.raw_data, sort_keys=True)
+            if t.raw_data is not None
+            else None,
         )
 
     @staticmethod
@@ -54,8 +108,9 @@ class TelemetryRepository:
             hostname=r.hostname,
             public_ip=ip_address(r.public_ip),  # type: ignore[arg-type]
             source=r.source,  # type: ignore[arg-type]
-            timestamp=r.timestamp,
+            timestamp=_utc_aware(r.timestamp),
             health_status=r.health_status,
+            raw_data=json.loads(r.raw_data_json) if r.raw_data_json is not None else None,
         )
 
     # -- public API ----------------------------------------------------------
@@ -64,6 +119,27 @@ class TelemetryRepository:
         """Insert an EndpointTelemetry record."""
         with get_session(self._engine) as session:
             session.add(self._to_record(t))
+
+    def save_many(self, telemetry: list[EndpointTelemetry]) -> int:
+        """Atomically insert new observations; return the number inserted.
+
+        A repeated observation with the same canonical fields, timestamp, and
+        source payload is ignored.
+        """
+        if not telemetry:
+            return 0
+        inserted = 0
+        with get_session(self._engine) as session:
+            seen = {_telemetry_key(row) for row in session.query(EndpointTelemetryRecord).all()}
+            for item in telemetry:
+                record = self._to_record(item)
+                key = _telemetry_key(record)
+                if key in seen:
+                    continue
+                seen.add(key)
+                session.add(record)
+                inserted += 1
+        return inserted
 
     def get_all(self) -> list[EndpointTelemetry]:
         """Return all stored endpoint telemetry records."""
@@ -110,8 +186,11 @@ class EventRepository:
             username=e.username,
             destination=e.destination,
             event_type=e.event_type,
-            timestamp=e.timestamp.replace(tzinfo=None),
+            timestamp=_utc_naive(e.timestamp),
             source=e.source,
+            raw_data_json=json.dumps(e.raw_data, sort_keys=True)
+            if e.raw_data is not None
+            else None,
         )
 
     @staticmethod
@@ -121,14 +200,42 @@ class EventRepository:
             username=r.username,
             destination=r.destination,
             event_type=r.event_type,  # type: ignore[arg-type]
-            timestamp=r.timestamp,
+            timestamp=_utc_aware(r.timestamp),
             source=r.source,  # type: ignore[arg-type]
+            raw_data=json.loads(r.raw_data_json) if r.raw_data_json is not None else None,
         )
 
     def save(self, e: ConnectionEvent) -> None:
         """Insert a ConnectionEvent record."""
         with get_session(self._engine) as session:
             session.add(self._to_record(e))
+
+    def save_many(self, events: list[ConnectionEvent]) -> int:
+        """Atomically insert new events; return the number inserted.
+
+        Raw source provenance is required for deduplication. Syslog lines with
+        only collection time use stable file/line provenance across replays.
+        Events without provenance are retained even when fields match.
+        """
+        if not events:
+            return 0
+        inserted = 0
+        with get_session(self._engine) as session:
+            seen = {
+                key
+                for row in session.query(ConnectionEventRecord).all()
+                if (key := _event_key(row)) is not None
+            }
+            for item in events:
+                record = self._to_record(item)
+                key = _event_key(record)
+                if key is not None:
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                session.add(record)
+                inserted += 1
+        return inserted
 
     def get_all(self) -> list[ConnectionEvent]:
         """Return all stored connection event records."""
@@ -176,7 +283,7 @@ class FindingRepository:
             severity=f.severity,
             source_ip=str(f.source_ip),
             description=f.description,
-            timestamp=f.timestamp.replace(tzinfo=None),
+            timestamp=_utc_naive(f.timestamp),
             connection_event_json=f.connection_event.model_dump_json(),
             matched_telemetry_json=(
                 f.matched_telemetry.model_dump_json() if f.matched_telemetry else None
@@ -200,7 +307,7 @@ class FindingRepository:
             connection_event=event,
             matched_telemetry=telemetry,
             description=r.description,
-            timestamp=r.timestamp,
+            timestamp=_utc_aware(r.timestamp),
         )
 
     def save(self, f: Finding) -> None:
@@ -217,20 +324,12 @@ class FindingRepository:
     def get_by_severity(self, severity: str) -> list[Finding]:
         """Return all findings with the given severity level."""
         with get_session(self._engine) as session:
-            rows = (
-                session.query(FindingRecord)
-                .filter(FindingRecord.severity == severity)
-                .all()
-            )
+            rows = session.query(FindingRecord).filter(FindingRecord.severity == severity).all()
             return [self._from_record(r) for r in rows]
 
     def get_since(self, ts: datetime) -> list[Finding]:
         """Return all findings with timestamp >= ts."""
-        naive_ts = ts.replace(tzinfo=None)
+        naive_ts = _utc_naive(ts)
         with get_session(self._engine) as session:
-            rows = (
-                session.query(FindingRecord)
-                .filter(FindingRecord.timestamp >= naive_ts)
-                .all()
-            )
+            rows = session.query(FindingRecord).filter(FindingRecord.timestamp >= naive_ts).all()
             return [self._from_record(r) for r in rows]

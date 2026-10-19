@@ -13,7 +13,7 @@ SQLAlchemy engine and session management.
 from collections.abc import Generator
 from contextlib import contextmanager
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 
 
@@ -23,10 +23,21 @@ def get_engine(db_url: str = "sqlite:///debacl.db") -> Engine:
 
 
 def init_db(engine: Engine) -> None:
-    """Create all tables defined in the declarative Base."""
+    """Create tables and add nullable provenance columns to older SQLite databases."""
     from .tables import Base
 
     Base.metadata.create_all(engine)
+
+    # create_all() does not alter existing tables. These additive nullable columns
+    # preserve previously stored records and make repeated init_db() calls safe.
+    if engine.dialect.name == "sqlite":
+        with engine.begin() as connection:
+            for table_name in ("endpoint_telemetry", "connection_events"):
+                columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+                if "raw_data_json" not in columns:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE {table_name} ADD COLUMN raw_data_json TEXT"
+                    )
 
 
 @contextmanager

@@ -36,15 +36,16 @@ from debacl.storage.repository import EventRepository, FindingRepository, Teleme
 # Helpers
 # ---------------------------------------------------------------------------
 
-NOW = datetime(2026, 4, 7, 12, 0, 0, tzinfo=UTC)
+# Keep the seeded observations within the correlation engine's 24-hour window.
+NOW = datetime.now(UTC).replace(microsecond=0)
 
 # Five known managed-endpoint IPs (TEST-NET-3 block — safe for documentation use)
 KNOWN_IPS = [f"203.0.113.{i}" for i in range(1, 6)]
 
 # Unknown IPs used for anomalous events
-ADMIN_IP = "198.51.100.99"    # TEST-NET-2 — privileged account hit
-REGULAR_IP = "192.0.2.50"    # TEST-NET-1 — regular account hit
-EVE_IP = "203.0.113.99"      # looks like managed range but not in inventory
+ADMIN_IP = "198.51.100.99"  # TEST-NET-2 — privileged account hit
+REGULAR_IP = "192.0.2.50"  # TEST-NET-1 — regular account hit
+EVE_IP = "203.0.113.99"  # looks like managed range but not in inventory
 
 
 def _make_engine():
@@ -96,8 +97,7 @@ TELEMETRY_RECORDS = [_make_telemetry(ip, i + 1) for i, ip in enumerate(KNOWN_IPS
 
 # 5 clean events from known IPs
 CLEAN_EVENTS = [
-    _make_event(ip, f"user{i + 1}@corp.com", "auth_success")
-    for i, ip in enumerate(KNOWN_IPS)
+    _make_event(ip, f"user{i + 1}@corp.com", "auth_success") for i, ip in enumerate(KNOWN_IPS)
 ]
 
 # 3 anomalous events (should each produce a finding)

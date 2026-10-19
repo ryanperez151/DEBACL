@@ -21,10 +21,12 @@ from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import Engine
 
+from debacl.config import get_settings
 from debacl.correlation.engine import CorrelationConfig, CorrelationEngine
 from debacl.models.events import ConnectionEvent
 from debacl.models.findings import Finding
 from debacl.models.telemetry import EndpointTelemetry
+from debacl.normalization import as_utc
 from debacl.storage.database import get_engine, init_db
 from debacl.storage.repository import EventRepository, FindingRepository, TelemetryRepository
 
@@ -44,7 +46,7 @@ def get_engine_dep() -> Engine:
     """
     global _DEFAULT_ENGINE
     if _DEFAULT_ENGINE is None:
-        _DEFAULT_ENGINE = get_engine("sqlite:///debacl.db")
+        _DEFAULT_ENGINE = get_engine(f"sqlite:///{get_settings().db_path}")
         init_db(_DEFAULT_ENGINE)
     return _DEFAULT_ENGINE
 
@@ -143,10 +145,8 @@ def list_telemetry(
         records = repo.get_all()
 
     if since is not None:
-        ts = datetime.fromisoformat(since)
-        # naive comparison — strip tzinfo if present for SQLite-stored naive datetimes
-        naive_ts = ts.replace(tzinfo=None)
-        records = [r for r in records if r.timestamp.replace(tzinfo=None) >= naive_ts]
+        ts = as_utc(datetime.fromisoformat(since))
+        records = [r for r in records if as_utc(r.timestamp) >= ts]
 
     return records[:limit]
 
@@ -176,9 +176,8 @@ def list_events(
         events = repo.get_all()
 
     if since is not None:
-        ts = datetime.fromisoformat(since)
-        naive_ts = ts.replace(tzinfo=None)
-        events = [e for e in events if e.timestamp.replace(tzinfo=None) >= naive_ts]
+        ts = as_utc(datetime.fromisoformat(since))
+        events = [e for e in events if as_utc(e.timestamp) >= ts]
 
     return events[:limit]
 

@@ -15,15 +15,24 @@ VPN log collector — parses CSV or syslog VPN connection logs into ConnectionEv
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
+import logging
 import re
 import tempfile
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
+
+from pydantic import ValidationError
 
 from debacl.collectors.base import BaseCollector, CollectorConfig
 from debacl.collectors.exceptions import CollectorError
 from debacl.collectors.mock_data import MockDataGenerator
 from debacl.models.events import ConnectionEvent
+
+logger = logging.getLogger(__name__)
+_CSV_REQUIRED_COLUMNS = {"timestamp", "username", "source_ip", "destination", "status"}
 
 
 class VpnLogConfig(CollectorConfig):
@@ -39,19 +48,19 @@ class VpnLogConfig(CollectorConfig):
 
 # Cisco AnyConnect: "... Group <group> User <user> IP <ip> ..."
 _ANYCONNECT_RE = re.compile(
-    r"User\s+<(?P<username>[^>]+)>.*?IP\s+<(?P<ip>[\d:.a-fA-F]+)>",
+    r"User\s+<(?P<username>[^>]+)>.*?IP\s+<(?P<ip>[^>]+)>",
     re.IGNORECASE,
 )
 
 # GlobalProtect: "... user: <user> ... client-ip: <ip> ..."
 _GLOBALPROTECT_RE = re.compile(
-    r"user:\s*(?P<username>\S+).*?client-ip:\s*(?P<ip>[\d:.a-fA-F]+)",
+    r"user:\s*(?P<username>\S+).*?client-ip:\s*(?P<ip>[^\s,;]+)",
     re.IGNORECASE,
 )
 
 # Generic syslog VPN: "... src=<ip> ... user=<user> ..."
 _GENERIC_VPN_RE = re.compile(
-    r"src=(?P<ip>[\d:.a-fA-F]+).*?user=(?P<username>\S+)",
+    r"src=(?P<ip>[^\s,;]+).*?user=(?P<username>\S+)",
     re.IGNORECASE,
 )
 
@@ -70,13 +79,12 @@ _STATUS_MAP = {
 }
 
 
-def _parse_timestamp(ts_str: str) -> datetime:
-    """Best-effort timestamp parser — falls back to now() on failure."""
+def _parse_timestamp(ts_str: str) -> datetime | None:
+    """Parse a CSV timestamp, returning None when the supplied value is invalid."""
     for fmt in (
         "%Y-%m-%dT%H:%M:%S.%f%z",
         "%Y-%m-%dT%H:%M:%S%z",
         "%Y-%m-%d %H:%M:%S",
-        "%b %d %H:%M:%S",
     ):
         try:
             dt = datetime.strptime(ts_str.strip(), fmt)
@@ -85,7 +93,7 @@ def _parse_timestamp(ts_str: str) -> datetime:
             return dt
         except ValueError:
             continue
-    return datetime.now(tz=UTC)
+    return None
 
 
 def _status_to_event_type(status: str) -> Literal["vpn_connect", "auth_success", "auth_failure"]:
@@ -101,8 +109,8 @@ class VpnLogCollector(BaseCollector[ConnectionEvent]):
       - Syslog: applies regex patterns for Cisco AnyConnect and GlobalProtect;
         falls back to a generic src=/user= pattern.
 
-    Invalid or incomplete rows are skipped with no exception raised (fail-open
-    for log parsing — partial data is better than no data).
+    Invalid or incomplete rows are skipped and counted. One aggregate warning
+    is emitted per collect call so partial data is visible without logging rows.
 
     Args:
         config: VpnLogConfig with log_path and log_format.
@@ -111,6 +119,7 @@ class VpnLogCollector(BaseCollector[ConnectionEvent]):
     def __init__(self, config: VpnLogConfig) -> None:
         super().__init__(config)
         self.config: VpnLogConfig = config
+        self.skipped_count = 0
 
     # ------------------------------------------------------------------
     # CSV parsing
@@ -119,13 +128,28 @@ class VpnLogCollector(BaseCollector[ConnectionEvent]):
     def _parse_csv(self, path: str) -> list[ConnectionEvent]:
         """Parse a CSV VPN log file into ConnectionEvents."""
         events: list[ConnectionEvent] = []
+        file_path = str(Path(path).resolve())
         try:
             with open(path, newline="", encoding="utf-8") as fh:
                 reader = csv.DictReader(fh)
+                if reader.fieldnames is None or not _CSV_REQUIRED_COLUMNS.issubset(
+                    reader.fieldnames
+                ):
+                    raise CollectorError("VPN log CSV is missing required columns")
                 for row in reader:
                     event = self._csv_row_to_event(row)
                     if event is not None:
+                        row_json = json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+                        row_bytes = row_json.encode("utf-8")
+                        event.raw_data = {
+                            **(event.raw_data or {}),
+                            "file_path": file_path,
+                            "line_number": reader.line_num,
+                            "record_sha256": hashlib.sha256(row_bytes).hexdigest(),
+                        }
                         events.append(event)
+                    else:
+                        self.skipped_count += 1
         except OSError as exc:
             raise CollectorError(f"VPN log CSV read error: {exc}") from exc
         return events
@@ -142,6 +166,10 @@ class VpnLogCollector(BaseCollector[ConnectionEvent]):
         if not ip or not username or not ts_str:
             return None
 
+        timestamp = _parse_timestamp(ts_str)
+        if timestamp is None:
+            return None
+
         event_type = _status_to_event_type(status)
         try:
             return ConnectionEvent(
@@ -149,10 +177,11 @@ class VpnLogCollector(BaseCollector[ConnectionEvent]):
                 username=username,
                 destination=destination,
                 event_type=event_type,
-                timestamp=_parse_timestamp(ts_str),
+                timestamp=timestamp,
                 source="vpn_log",
+                raw_data={"timestamp_basis": "source_record"},
             )
-        except Exception:
+        except ValidationError:
             return None
 
     # ------------------------------------------------------------------
@@ -162,12 +191,21 @@ class VpnLogCollector(BaseCollector[ConnectionEvent]):
     def _parse_syslog(self, path: str) -> list[ConnectionEvent]:
         """Parse a syslog-format VPN log file into ConnectionEvents."""
         events: list[ConnectionEvent] = []
+        file_path = str(Path(path).resolve())
         try:
             with open(path, encoding="utf-8") as fh:
-                for line in fh:
+                for line_number, line in enumerate(fh, start=1):
                     event = self._syslog_line_to_event(line)
                     if event is not None:
+                        event.raw_data = {
+                            **(event.raw_data or {}),
+                            "file_path": file_path,
+                            "line_number": line_number,
+                            "record_sha256": hashlib.sha256(line.encode("utf-8")).hexdigest(),
+                        }
                         events.append(event)
+                    else:
+                        self.skipped_count += 1
         except OSError as exc:
             raise CollectorError(f"VPN log syslog read error: {exc}") from exc
         return events
@@ -198,8 +236,9 @@ class VpnLogCollector(BaseCollector[ConnectionEvent]):
                         event_type=event_type,
                         timestamp=datetime.now(tz=UTC),
                         source="vpn_log",
+                        raw_data={"timestamp_basis": "collection_time"},
                     )
-                except Exception:
+                except ValidationError:
                     continue
         return None
 
@@ -212,20 +251,28 @@ class VpnLogCollector(BaseCollector[ConnectionEvent]):
 
         In mock_mode generates a synthetic CSV then parses it.
         """
+        self.skipped_count = 0
         if self.config.mock_mode:
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".csv", delete=False, encoding="utf-8"
             ) as tmp:
-                tmp_path = tmp.name
-            MockDataGenerator().generate_vpn_log_file(tmp_path)
-            return self._parse_csv(tmp_path)
+                tmp_path = Path(tmp.name)
+            try:
+                MockDataGenerator().generate_vpn_log_file(str(tmp_path))
+                events = self._parse_csv(str(tmp_path))
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        else:
+            if not self.config.log_path:
+                raise CollectorError("VpnLogConfig.log_path is required in live mode")
 
-        if not self.config.log_path:
-            raise CollectorError("VpnLogConfig.log_path is required in live mode")
+            if self.config.log_format == "csv":
+                events = self._parse_csv(self.config.log_path)
+            elif self.config.log_format == "syslog":
+                events = self._parse_syslog(self.config.log_path)
+            else:
+                raise CollectorError(f"Unknown log_format: {self.config.log_format!r}")
 
-        if self.config.log_format == "csv":
-            return self._parse_csv(self.config.log_path)
-        if self.config.log_format == "syslog":
-            return self._parse_syslog(self.config.log_path)
-
-        raise CollectorError(f"Unknown log_format: {self.config.log_format!r}")
+        if self.skipped_count:
+            logger.warning("VPN log skipped %d malformed row(s) or line(s)", self.skipped_count)
+        return events
