@@ -10,7 +10,7 @@ Tests for the SQLite storage layer (repositories).
            get_by_severity, get_since).
 """
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -101,6 +101,25 @@ def make_finding(**overrides) -> Finding:
 
 
 class TestTelemetryRepository:
+    def test_save_many_deduplicates_observations(self, telemetry_repo):
+        observation = make_telemetry(raw_data={"provider": "fixture"})
+        assert telemetry_repo.save_many([observation, observation]) == 1
+        assert telemetry_repo.save_many([observation]) == 0
+        assert len(telemetry_repo.get_all()) == 1
+
+    def test_save_many_preserves_distinct_source_payloads(self, telemetry_repo):
+        first = make_telemetry(raw_data={"provider_record": "one"})
+        second = make_telemetry(raw_data={"provider_record": "two"})
+        assert telemetry_repo.save_many([first, second]) == 2
+        assert len(telemetry_repo.get_all()) == 2
+
+    def test_save_many_rolls_back_whole_batch_on_error(self, telemetry_repo):
+        valid = make_telemetry(device_id="valid")
+        invalid = make_telemetry(device_id="invalid", raw_data={"not_json": {1}})
+        with pytest.raises(TypeError):
+            telemetry_repo.save_many([valid, invalid])
+        assert telemetry_repo.get_all() == []
+
     def test_save_and_get_all(self, telemetry_repo):
         t = make_telemetry()
         telemetry_repo.save(t)
@@ -149,6 +168,24 @@ class TestTelemetryRepository:
         results = telemetry_repo.get_all()
         assert results[0].health_status is None
 
+    def test_raw_data_and_offset_timestamp_round_trip(self, telemetry_repo):
+        observed = datetime(2026, 3, 5, 12, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        raw = {"provider_id": "device-1", "nested": {"items": [1, 2]}}
+        telemetry_repo.save(make_telemetry(timestamp=observed, raw_data=raw))
+
+        result = telemetry_repo.get_all()[0]
+        assert result.raw_data == raw
+        assert result.timestamp == datetime(2026, 3, 5, 7, 0, tzinfo=UTC)
+        assert result.timestamp.tzinfo is UTC
+
+    def test_naive_timestamp_is_treated_as_utc(self, telemetry_repo):
+        naive = datetime(2026, 3, 5, 12, 0)
+        telemetry_repo.save(make_telemetry(timestamp=naive, raw_data={}))
+
+        result = telemetry_repo.get_all()[0]
+        assert result.timestamp == naive.replace(tzinfo=UTC)
+        assert result.raw_data == {}
+
 
 # ---------------------------------------------------------------------------
 # EventRepository
@@ -156,6 +193,23 @@ class TestTelemetryRepository:
 
 
 class TestEventRepository:
+    def test_save_many_deduplicates_events(self, event_repo):
+        event = make_event(raw_data={"provider": "fixture"})
+        assert event_repo.save_many([event, event]) == 1
+        assert event_repo.save_many([event]) == 0
+        assert len(event_repo.get_all()) == 1
+
+    def test_save_many_preserves_distinct_provider_events(self, event_repo):
+        first = make_event(raw_data={"provider_event_id": "one"})
+        second = make_event(raw_data={"provider_event_id": "two"})
+        assert event_repo.save_many([first, second]) == 2
+        assert len(event_repo.get_all()) == 2
+
+    def test_save_many_does_not_collapse_events_without_identity(self, event_repo):
+        event = make_event(raw_data=None)
+        assert event_repo.save_many([event, event]) == 2
+        assert len(event_repo.get_all()) == 2
+
     def test_save_and_get_all(self, event_repo):
         e = make_event()
         event_repo.save(e)
@@ -198,6 +252,16 @@ class TestEventRepository:
         event_repo.save(make_event(event_type="auth_failure"))
         results = event_repo.get_all()
         assert results[0].event_type == "auth_failure"
+
+    def test_raw_data_and_offset_timestamp_round_trip(self, event_repo):
+        observed = datetime(2026, 3, 5, 1, 0, tzinfo=timezone(-timedelta(hours=3)))
+        raw = {"event_id": "signin-1", "status": {"errorCode": 0}}
+        event_repo.save(make_event(timestamp=observed, raw_data=raw))
+
+        result = event_repo.get_all()[0]
+        assert result.raw_data == raw
+        assert result.timestamp == datetime(2026, 3, 5, 4, 0, tzinfo=UTC)
+        assert result.timestamp.tzinfo is UTC
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +333,73 @@ class TestFindingRepository:
         results = finding_repo.get_since(NOW)
         assert len(results) == 1
 
+    def test_get_since_converts_offset_to_utc(self, finding_repo):
+        finding_repo.save(make_finding(timestamp=NOW))
+        cutoff = datetime(2026, 3, 5, 14, 0, tzinfo=timezone(timedelta(hours=2)))
+
+        results = finding_repo.get_since(cutoff)
+        assert len(results) == 1
+        assert results[0].timestamp == NOW
+
     def test_get_all_multiple_findings(self, finding_repo):
         finding_repo.save(make_finding(severity="high"))
         finding_repo.save(make_finding(severity="critical"))
         results = finding_repo.get_all()
         assert len(results) == 2
+
+
+def test_init_db_upgrades_legacy_sqlite_tables_without_losing_rows(tmp_path):
+    engine = get_engine(f"sqlite:///{tmp_path / 'legacy.db'}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """CREATE TABLE endpoint_telemetry (
+                id INTEGER PRIMARY KEY,
+                device_id VARCHAR NOT NULL,
+                hostname VARCHAR NOT NULL,
+                public_ip VARCHAR NOT NULL,
+                source VARCHAR NOT NULL,
+                timestamp DATETIME NOT NULL,
+                health_status VARCHAR
+            )"""
+        )
+        connection.exec_driver_sql(
+            """CREATE TABLE connection_events (
+                id INTEGER PRIMARY KEY,
+                source_ip VARCHAR NOT NULL,
+                username VARCHAR NOT NULL,
+                destination VARCHAR NOT NULL,
+                event_type VARCHAR NOT NULL,
+                timestamp DATETIME NOT NULL,
+                source VARCHAR NOT NULL
+            )"""
+        )
+        connection.exec_driver_sql(
+            """INSERT INTO endpoint_telemetry
+               (device_id, hostname, public_ip, source, timestamp)
+               VALUES ('old-device', 'old-host', '203.0.113.10', 'intune', '2026-03-05 12:00:00')"""
+        )
+        connection.exec_driver_sql(
+            """INSERT INTO connection_events
+               (source_ip, username, destination, event_type, timestamp, source)
+               VALUES ('198.51.100.10', 'alice', 'vpn', 'auth_success',
+                       '2026-03-05 12:00:00', 'entra')"""
+        )
+
+    init_db(engine)
+    init_db(engine)
+
+    telemetry_repo = TelemetryRepository(engine)
+    event_repo = EventRepository(engine)
+    old_telemetry = telemetry_repo.get_all()[0]
+    old_event = event_repo.get_all()[0]
+    assert old_telemetry.device_id == "old-device"
+    assert old_telemetry.raw_data is None
+    assert old_telemetry.timestamp == NOW
+    assert old_event.username == "alice"
+    assert old_event.raw_data is None
+    assert old_event.timestamp == NOW
+
+    telemetry_repo.save(make_telemetry(raw_data={"provider_id": "new-device"}))
+    event_repo.save(make_event(raw_data={"provider_id": "new-event"}))
+    assert telemetry_repo.get_all()[1].raw_data == {"provider_id": "new-device"}
+    assert event_repo.get_all()[1].raw_data == {"provider_id": "new-event"}

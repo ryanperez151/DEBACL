@@ -33,6 +33,7 @@ class EndpointTelemetryRecord(Base):
     source: Mapped[str] = mapped_column(String, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     health_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    raw_data_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class ConnectionEventRecord(Base):
@@ -47,6 +48,7 @@ class ConnectionEventRecord(Base):
     event_type: Mapped[str] = mapped_column(String, nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     source: Mapped[str] = mapped_column(String, nullable=False)
+    raw_data_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class FindingRecord(Base):

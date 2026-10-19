@@ -120,9 +120,48 @@ uv run debacl serve --port 8000
 
 All sources support `--mock` mode for evaluation without credentials.
 
+### Collection behavior and limits
+
+`collect --all --mock` runs all six adapters. `collect --all --no-mock` runs only
+sources enabled with `DEBACL_<SOURCE>_ENABLED=true`; `collect --source <name>
+--no-mock` explicitly selects one source. Live collection checks required settings
+before contacting a provider. All commands use `DEBACL_DB_PATH` (default
+`debacl.db`) for the SQLite database. `--no-save` collects without opening it.
+
+Collectors normalize provider responses into IP-typed endpoint telemetry or
+connection events. A missing or invalid IP never becomes a device identifier or
+sentinel IP. Skipped source records are counted and warned about without printing
+their contents. `collect` exits nonzero when records were skipped or a source
+failed, even if other valid records were saved. A valid empty response prints
+"No usable records returned"; malformed responses and fetch failures exit nonzero.
+Each source's database insert is atomic. Repeated endpoint observations and events
+with stable raw provenance are deduplicated. Events without such provenance are
+retained because identical IP/user/time fields do not prove they are the same
+event.
+
+Provider API payloads and VPN file provenance are retained in the local database
+as `raw_data`; timestamps with offsets are converted to UTC. Older rows cannot
+recover payloads or offsets discarded before this change. VPN CSV needs an
+absolute timestamp; yearless or invalid CSV timestamps are skipped. The
+supported syslog patterns lack a year,
+so their events use collection time, marked as `timestamp_basis=collection_time`
+in `raw_data`. This is not the original event time.
+
+Intune accepts only an explicit `publicIpAddress`. The documented Microsoft Graph
+[v1.0 managedDevice](https://learn.microsoft.com/en-us/graph/api/resources/intune-devices-manageddevice?view=graph-rest-1.0)
+and [beta managedDevice](https://learn.microsoft.com/en-us/graph/api/resources/intune-devices-manageddevice?view=graph-rest-beta)
+schemas do not list that field, so standard Intune responses may yield no usable
+public-IP telemetry. A Wi-Fi MAC or local interface IP is not a substitute.
+
+Correlation currently matches IPs, and an IP shared by multiple devices (such as
+through NAT) does not establish device identity. The current correlation policy
+may treat an event from any known IP as clean; use findings as IP-level signals,
+not proof that a particular device connected.
+
 ### Configuration
 
-Copy `config.example.toml` and set credentials, or use environment variables with the `DEBACL_` prefix:
+Set credentials through `DEBACL_` environment variables or a local `.env` file.
+`config.example.toml` is a reference; it is not loaded by the settings class:
 
 ```bash
 export DEBACL_CROWDSTRIKE_CLIENT_ID=your-id
@@ -144,6 +183,6 @@ Findings are classified by type and severity:
 ### Running Tests
 
 ```bash
-uv run pytest          # 309 tests across all modules
+uv run pytest          # all tests across the CLI, collectors, storage, API, and engine
 uv run ruff check .    # linting
 ```

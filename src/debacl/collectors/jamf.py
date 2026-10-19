@@ -12,12 +12,17 @@ Jamf Pro collector — fetches managed Mac/iOS device IPs via Jamf Pro API.
 
 from __future__ import annotations
 
+import logging
+from ipaddress import ip_address
+
 import httpx
 
 from debacl.collectors.base import BaseCollector, CollectorConfig
 from debacl.collectors.exceptions import CollectorError
 from debacl.collectors.mock_data import MockDataGenerator
 from debacl.models.telemetry import EndpointTelemetry
+
+logger = logging.getLogger(__name__)
 
 
 class JamfConfig(CollectorConfig):
@@ -44,6 +49,7 @@ class JamfCollector(BaseCollector[EndpointTelemetry]):
     def __init__(self, config: JamfConfig) -> None:
         super().__init__(config)
         self.config: JamfConfig = config
+        self.skipped_count = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -60,9 +66,7 @@ class JamfCollector(BaseCollector[EndpointTelemetry]):
             },
         )
         if resp.status_code != 200:
-            raise CollectorError(
-                f"Jamf OAuth token request failed: {resp.status_code} {resp.text}"
-            )
+            raise CollectorError(f"Jamf OAuth token request failed: {resp.status_code} {resp.text}")
         return resp.json()["access_token"]
 
     def _fetch_inventory(self, client: httpx.Client, token: str) -> list[dict]:
@@ -71,6 +75,7 @@ class JamfCollector(BaseCollector[EndpointTelemetry]):
         page = 0
         page_size = 100
         headers = {"Authorization": f"Bearer {token}"}
+        expected_total: int | None = None
 
         while True:
             resp = client.get(
@@ -86,12 +91,25 @@ class JamfCollector(BaseCollector[EndpointTelemetry]):
                 raise CollectorError(
                     f"Jamf inventory request failed: {resp.status_code} {resp.text}"
                 )
-            body = resp.json()
-            results = body.get("results", [])
+            try:
+                body = resp.json()
+            except ValueError:
+                raise CollectorError("Jamf inventory returned invalid JSON") from None
+            if not isinstance(body, dict) or not isinstance(body.get("results"), list):
+                raise CollectorError("Jamf inventory returned invalid results")
+            results = body["results"]
             computers.extend(results)
-            total_count = body.get("totalCount", len(computers))
+            total_count = body.get("totalCount")
+            if type(total_count) is not int or total_count < 0:
+                raise CollectorError("Jamf inventory returned invalid totalCount")
+            if expected_total is None:
+                expected_total = total_count
+            elif total_count != expected_total:
+                raise CollectorError("Jamf inventory returned inconsistent totalCount")
             page += 1
-            if len(computers) >= total_count or not results:
+            if len(computers) > total_count or (not results and len(computers) < total_count):
+                raise CollectorError("Jamf inventory returned incomplete pagination")
+            if len(computers) == total_count:
                 break
 
         return computers
@@ -99,22 +117,46 @@ class JamfCollector(BaseCollector[EndpointTelemetry]):
     @staticmethod
     def _normalize(raw: dict) -> EndpointTelemetry | None:
         """Convert a raw Jamf inventory record to EndpointTelemetry."""
-        general = raw.get("general", {})
-        last_ip = general.get("lastIpAddress") or general.get("lastReportedIp")
-        if not last_ip:
+        if not isinstance(raw, dict):
+            raise CollectorError("Jamf normalization error: invalid inventory record")
+        device_id = raw.get("id")
+        if (
+            isinstance(device_id, bool)
+            or not isinstance(device_id, (str, int))
+            or not str(device_id).strip()
+        ):
             return None
+        general = raw.get("general", {})
+        if general is None:
+            general = {}
+        elif not isinstance(general, dict):
+            raise CollectorError("Jamf normalization error: invalid inventory record")
+        last_ip = general.get("lastIpAddress")
+        if last_ip is None or (isinstance(last_ip, str) and not last_ip.strip()):
+            last_ip = general.get("lastReportedIp")
+        if last_ip is None or (isinstance(last_ip, str) and not last_ip.strip()):
+            return None
+
+        if not isinstance(last_ip, str):
+            raise CollectorError("Jamf normalization error: invalid IP address")
+
+        try:
+            parsed_ip = ip_address(last_ip.strip())
+        except ValueError:
+            raise CollectorError("Jamf normalization error: invalid IP address") from None
+
         try:
             return EndpointTelemetry(
-                device_id=str(raw.get("id", "")),
+                device_id=str(device_id).strip(),
                 hostname=general.get("name", ""),
-                public_ip=last_ip,
+                public_ip=parsed_ip,
                 source="jamf",
                 timestamp=general.get("lastContactTime", general.get("reportDate", "")),
                 health_status=raw.get("operatingSystem", {}).get("version"),
                 raw_data=raw,
             )
-        except Exception as exc:
-            raise CollectorError(f"Jamf normalization error: {exc}") from exc
+        except Exception:
+            raise CollectorError("Jamf normalization error: invalid inventory record") from None
 
     # ------------------------------------------------------------------
     # BaseCollector interface
@@ -125,6 +167,7 @@ class JamfCollector(BaseCollector[EndpointTelemetry]):
 
         Uses MockDataGenerator when config.mock_mode is True.
         """
+        self.skipped_count = 0
         if self.config.mock_mode:
             return MockDataGenerator().generate_endpoint_telemetry("jamf")
 
@@ -137,7 +180,18 @@ class JamfCollector(BaseCollector[EndpointTelemetry]):
 
         results: list[EndpointTelemetry] = []
         for raw in raw_computers:
-            record = self._normalize(raw)
-            if record is not None:
+            try:
+                record = self._normalize(raw)
+            except CollectorError:
+                self.skipped_count += 1
+                continue
+            if record is None:
+                self.skipped_count += 1
+            else:
                 results.append(record)
+        if self.skipped_count:
+            logger.warning(
+                "Jamf skipped %d invalid or incomplete computer record(s)",
+                self.skipped_count,
+            )
         return results

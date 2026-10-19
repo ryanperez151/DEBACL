@@ -73,6 +73,12 @@ class TestJamfMockMode:
         collector = JamfCollector(_make_config(mock_mode=True))
         assert len(collector.collect()) > 0
 
+    def test_mock_mode_resets_skip_count(self):
+        collector = JamfCollector(_make_config(mock_mode=True))
+        collector.skipped_count = 7
+        collector.collect()
+        assert collector.skipped_count == 0
+
 
 class TestJamfLiveMode:
     def test_normalization_correct(self, httpx_mock: HTTPXMock):
@@ -92,7 +98,7 @@ class TestJamfLiveMode:
         assert result[0].source == "jamf"
         assert result[0].hostname == "CORP-LAPTOP-001"
 
-    def test_skips_computers_without_ip(self, httpx_mock: HTTPXMock):
+    def test_skips_computers_without_ip(self, httpx_mock: HTTPXMock, caplog):
         no_ip = {"id": 99, "general": {"name": "X", "lastContactTime": "2026-03-05T08:00:00Z"}}
         httpx_mock.add_response(method="POST", url=_TOKEN_URL, json=_TOKEN_RESP)
         httpx_mock.add_response(
@@ -103,6 +109,91 @@ class TestJamfLiveMode:
 
         collector = JamfCollector(_make_config(mock_mode=False))
         assert collector.collect() == []
+        assert collector.skipped_count == 1
+        warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+        assert warnings == ["Jamf skipped 1 invalid or incomplete computer record(s)"]
+        assert "99" not in warnings[0]
+
+    def test_mixed_missing_invalid_and_valid_records_warn_once(self, httpx_mock: HTTPXMock, caplog):
+        httpx_mock.add_response(method="POST", url=_TOKEN_URL, json=_TOKEN_RESP)
+        httpx_mock.add_response(
+            method="GET",
+            url=_INVENTORY_URL,
+            json={
+                "results": [
+                    {"id": 1, "general": {"lastIpAddress": None}},
+                    {"id": 2, "general": {"lastIpAddress": "  "}},
+                    {"id": 4, "general": {"lastIpAddress": "aa:bb:cc:dd:ee:ff"}},
+                    {
+                        "id": 3,
+                        "general": {
+                            "lastReportedIp": "2001:db8::4",
+                            "lastContactTime": "2026-03-05T08:00:00Z",
+                        },
+                    },
+                ],
+                "totalCount": 4,
+            },
+        )
+
+        collector = JamfCollector(_make_config(mock_mode=False))
+        result = collector.collect()
+
+        assert collector.skipped_count == 3
+        assert len(result) == 1
+        assert str(result[0].public_ip) == "2001:db8::4"
+        warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+        assert warnings == ["Jamf skipped 3 invalid or incomplete computer record(s)"]
+        assert "aa:bb:cc:dd:ee:ff" not in warnings[0]
+
+    @pytest.mark.parametrize("bad_ip", ["aa:bb:cc:dd:ee:ff", 123])
+    def test_present_invalid_ip_raises_sanitized_error(self, bad_ip):
+        with pytest.raises(CollectorError, match="invalid IP address") as exc:
+            JamfCollector._normalize({"id": "secret-id", "general": {"lastIpAddress": bad_ip}})
+        assert str(bad_ip) not in str(exc.value)
+        assert "secret-id" not in str(exc.value)
+
+    def test_missing_ids_are_skipped_but_integer_zero_is_valid(self, httpx_mock: HTTPXMock, caplog):
+        general = {"lastIpAddress": "198.51.100.20", "lastContactTime": "2026-03-05T08:00:00Z"}
+        httpx_mock.add_response(method="POST", url=_TOKEN_URL, json=_TOKEN_RESP)
+        httpx_mock.add_response(
+            method="GET",
+            url=_INVENTORY_URL,
+            json={
+                "results": [
+                    _COMPUTER_1,
+                    {"general": general},
+                    {"id": "  ", "general": general},
+                    {"id": 0, "general": general},
+                ],
+                "totalCount": 4,
+            },
+        )
+
+        collector = JamfCollector(_make_config(mock_mode=False))
+        result = collector.collect()
+
+        assert collector.skipped_count == 2
+        assert [(r.device_id, str(r.public_ip)) for r in result] == [
+            ("1", "203.0.113.10"),
+            ("0", "198.51.100.20"),
+        ]
+        warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+        assert warnings == ["Jamf skipped 2 invalid or incomplete computer record(s)"]
+        assert "198.51.100.20" not in warnings[0]
+
+    def test_empty_inventory_resets_skip_count(self, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(method="POST", url=_TOKEN_URL, json=_TOKEN_RESP)
+        httpx_mock.add_response(
+            method="GET",
+            url=_INVENTORY_URL,
+            json={"results": [], "totalCount": 0},
+        )
+
+        collector = JamfCollector(_make_config(mock_mode=False))
+        collector.skipped_count = 7
+        assert collector.collect() == []
+        assert collector.skipped_count == 0
 
     def test_token_failure_raises_collector_error(self, httpx_mock: HTTPXMock):
         httpx_mock.add_response(method="POST", url=_TOKEN_URL, status_code=401, text="Unauthorized")
@@ -122,4 +213,47 @@ class TestJamfLiveMode:
 
         collector = JamfCollector(_make_config(mock_mode=False))
         with pytest.raises(CollectorError, match="inventory"):
+            collector.collect()
+
+    @pytest.mark.parametrize("payload", [{}, {"results": {}}, {"results": None}])
+    def test_malformed_inventory_is_fatal(self, httpx_mock: HTTPXMock, payload):
+        httpx_mock.add_response(method="POST", url=_TOKEN_URL, json=_TOKEN_RESP)
+        httpx_mock.add_response(method="GET", url=_INVENTORY_URL, json=payload)
+
+        collector = JamfCollector(_make_config(mock_mode=False))
+        with pytest.raises(CollectorError, match="invalid results"):
+            collector.collect()
+
+    def test_inventory_missing_declared_total_is_fatal(self, httpx_mock: HTTPXMock):
+        httpx_mock.add_response(method="POST", url=_TOKEN_URL, json=_TOKEN_RESP)
+        httpx_mock.add_response(method="GET", url=_INVENTORY_URL, json={"results": []})
+
+        collector = JamfCollector(_make_config(mock_mode=False))
+        with pytest.raises(CollectorError, match="invalid totalCount"):
+            collector.collect()
+
+    @pytest.mark.parametrize(
+        "second_page,reason",
+        [
+            ({"results": [], "totalCount": 2}, "incomplete"),
+            ({"results": [_COMPUTER_2], "totalCount": 3}, "inconsistent"),
+        ],
+    )
+    def test_inventory_declared_total_mismatch_is_fatal(
+        self, httpx_mock: HTTPXMock, second_page, reason
+    ):
+        httpx_mock.add_response(method="POST", url=_TOKEN_URL, json=_TOKEN_RESP)
+        httpx_mock.add_response(
+            method="GET",
+            url=_INVENTORY_URL,
+            json={"results": [_COMPUTER_1], "totalCount": 2},
+        )
+        httpx_mock.add_response(
+            method="GET",
+            url=_INVENTORY_URL.replace("page=0", "page=1"),
+            json=second_page,
+        )
+
+        collector = JamfCollector(_make_config(mock_mode=False))
+        with pytest.raises(CollectorError, match=reason):
             collector.collect()

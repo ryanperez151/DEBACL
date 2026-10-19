@@ -13,6 +13,9 @@ CrowdStrike Falcon collector — fetches managed endpoint public IPs via Falcon 
 
 from __future__ import annotations
 
+import logging
+from ipaddress import ip_address
+
 import httpx
 from pydantic import BaseModel
 
@@ -20,6 +23,8 @@ from debacl.collectors.base import BaseCollector, CollectorConfig
 from debacl.collectors.exceptions import CollectorError
 from debacl.collectors.mock_data import MockDataGenerator
 from debacl.models.telemetry import EndpointTelemetry
+
+logger = logging.getLogger(__name__)
 
 
 class CrowdStrikeConfig(CollectorConfig):
@@ -53,6 +58,7 @@ class CrowdStrikeCollector(BaseCollector[EndpointTelemetry]):
     def __init__(self, config: CrowdStrikeConfig) -> None:
         super().__init__(config)
         self.config: CrowdStrikeConfig = config
+        self.skipped_count = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -79,6 +85,7 @@ class CrowdStrikeCollector(BaseCollector[EndpointTelemetry]):
         ids: list[str] = []
         offset = 0
         limit = 500
+        expected_total: int | None = None
         while True:
             resp = client.get(
                 f"{self.config.base_url}/devices/queries/devices/v1",
@@ -89,13 +96,33 @@ class CrowdStrikeCollector(BaseCollector[EndpointTelemetry]):
                 raise CollectorError(
                     f"CrowdStrike device query failed: {resp.status_code} {resp.text}"
                 )
-            body = resp.json()
-            page = body.get("resources", [])
+            try:
+                body = resp.json()
+            except ValueError:
+                raise CollectorError("CrowdStrike device query returned invalid JSON") from None
+            if not isinstance(body, dict) or not isinstance(body.get("resources"), list):
+                raise CollectorError("CrowdStrike device query returned invalid resources")
+            page = body["resources"]
+            if any(not isinstance(device_id, str) or not device_id.strip() for device_id in page):
+                raise CollectorError("CrowdStrike device query returned invalid resources")
             ids.extend(page)
-            meta = body.get("meta", {}).get("pagination", {})
-            total = meta.get("total", len(ids))
+            meta = body.get("meta", {})
+            if not isinstance(meta, dict):
+                raise CollectorError("CrowdStrike device query returned invalid pagination")
+            meta = meta.get("pagination", {})
+            if not isinstance(meta, dict):
+                raise CollectorError("CrowdStrike device query returned invalid pagination")
+            total = meta.get("total")
+            if type(total) is not int or total < 0:
+                raise CollectorError("CrowdStrike device query returned invalid pagination")
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise CollectorError("CrowdStrike device query returned inconsistent pagination")
             offset += len(page)
-            if offset >= total or not page:
+            if offset > total or (not page and offset < total):
+                raise CollectorError("CrowdStrike device query returned incomplete pagination")
+            if offset == total:
                 break
         return ids
 
@@ -114,30 +141,63 @@ class CrowdStrikeCollector(BaseCollector[EndpointTelemetry]):
             )
             if resp.status_code != 200:
                 raise CollectorError(
-                    f"CrowdStrike device entities request failed: "
-                    f"{resp.status_code} {resp.text}"
+                    f"CrowdStrike device entities request failed: {resp.status_code} {resp.text}"
                 )
-            details.extend(resp.json().get("resources", []))
+            try:
+                body = resp.json()
+            except ValueError:
+                raise CollectorError("CrowdStrike device entities returned invalid JSON") from None
+            if not isinstance(body, dict) or not isinstance(body.get("resources"), list):
+                raise CollectorError("CrowdStrike device entities returned invalid resources")
+            resources = body["resources"]
+            if len(resources) != len(batch):
+                raise CollectorError("CrowdStrike device entities response is incomplete")
+            returned_ids: set[str] = set()
+            for device in resources:
+                if not isinstance(device, dict):
+                    continue
+                device_id = device.get("device_id")
+                if not isinstance(device_id, str) or not device_id.strip():
+                    continue
+                device_id = device_id.strip()
+                if device_id not in batch or device_id in returned_ids:
+                    raise CollectorError("CrowdStrike device entities response is incomplete")
+                returned_ids.add(device_id)
+            details.extend(resources)
         return details
 
     @staticmethod
     def _normalize(raw: dict) -> EndpointTelemetry | None:
         """Convert a raw Falcon device record to EndpointTelemetry, or None if unusable."""
-        external_ip = raw.get("external_ip")
-        if not external_ip:
+        if not isinstance(raw, dict):
+            raise CollectorError("CrowdStrike normalization error: invalid device record")
+        device_id = raw.get("device_id")
+        if not isinstance(device_id, str) or not device_id.strip():
             return None
+        external_ip = raw.get("external_ip")
+        if external_ip is None or (isinstance(external_ip, str) and not external_ip.strip()):
+            return None
+
+        if not isinstance(external_ip, str):
+            raise CollectorError("CrowdStrike normalization error: invalid external_ip")
+
+        try:
+            parsed_ip = ip_address(external_ip.strip())
+        except ValueError:
+            raise CollectorError("CrowdStrike normalization error: invalid external_ip") from None
+
         try:
             return EndpointTelemetry(
-                device_id=raw.get("device_id", ""),
+                device_id=device_id.strip(),
                 hostname=raw.get("hostname", ""),
-                public_ip=external_ip,
+                public_ip=parsed_ip,
                 source="crowdstrike",
                 timestamp=raw.get("last_seen", raw.get("modified_timestamp", "")),
                 health_status=raw.get("status"),
                 raw_data=raw,
             )
-        except Exception as exc:
-            raise CollectorError(f"CrowdStrike normalization error: {exc}") from exc
+        except Exception:
+            raise CollectorError("CrowdStrike normalization error: invalid device record") from None
 
     # ------------------------------------------------------------------
     # BaseCollector interface
@@ -148,6 +208,7 @@ class CrowdStrikeCollector(BaseCollector[EndpointTelemetry]):
 
         Uses MockDataGenerator when config.mock_mode is True.
         """
+        self.skipped_count = 0
         if self.config.mock_mode:
             return MockDataGenerator().generate_endpoint_telemetry("crowdstrike")
 
@@ -163,7 +224,18 @@ class CrowdStrikeCollector(BaseCollector[EndpointTelemetry]):
 
         results: list[EndpointTelemetry] = []
         for raw in raw_devices:
-            record = self._normalize(raw)
-            if record is not None:
+            try:
+                record = self._normalize(raw)
+            except CollectorError:
+                self.skipped_count += 1
+                continue
+            if record is None:
+                self.skipped_count += 1
+            else:
                 results.append(record)
+        if self.skipped_count:
+            logger.warning(
+                "CrowdStrike skipped %d invalid or incomplete device record(s)",
+                self.skipped_count,
+            )
         return results

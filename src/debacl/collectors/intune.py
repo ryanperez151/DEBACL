@@ -13,12 +13,17 @@ Microsoft Intune collector — fetches managed device public IPs via Microsoft G
 
 from __future__ import annotations
 
+import logging
+from ipaddress import ip_address
+
 import httpx
 
 from debacl.collectors.base import BaseCollector, CollectorConfig
 from debacl.collectors.exceptions import CollectorError
 from debacl.collectors.mock_data import MockDataGenerator
 from debacl.models.telemetry import EndpointTelemetry
+
+logger = logging.getLogger(__name__)
 
 
 class IntuneConfig(CollectorConfig):
@@ -46,6 +51,7 @@ class IntuneCollector(BaseCollector[EndpointTelemetry]):
     def __init__(self, config: IntuneConfig) -> None:
         super().__init__(config)
         self.config: IntuneConfig = config
+        self.skipped_count = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -53,10 +59,7 @@ class IntuneCollector(BaseCollector[EndpointTelemetry]):
 
     def _get_token(self, client: httpx.Client) -> str:
         """Obtain a Bearer token via MSAL client credentials flow."""
-        token_url = (
-            f"https://login.microsoftonline.com/{self.config.tenant_id}"
-            "/oauth2/v2.0/token"
-        )
+        token_url = f"https://login.microsoftonline.com/{self.config.tenant_id}/oauth2/v2.0/token"
         resp = client.post(
             token_url,
             data={
@@ -84,43 +87,60 @@ class IntuneCollector(BaseCollector[EndpointTelemetry]):
                 raise CollectorError(
                     f"Intune Graph API request failed: {resp.status_code} {resp.text}"
                 )
-            body = resp.json()
-            devices.extend(body.get("value", []))
-            url = body.get("@odata.nextLink")
+            try:
+                body = resp.json()
+            except ValueError:
+                raise CollectorError("Intune Graph API returned invalid JSON") from None
+            if not isinstance(body, dict) or not isinstance(body.get("value"), list):
+                raise CollectorError("Intune Graph API returned invalid managedDevices data")
+            next_link = body.get("@odata.nextLink")
+            if next_link is not None and not isinstance(next_link, str):
+                raise CollectorError("Intune Graph API returned invalid pagination data")
+            devices.extend(body["value"])
+            url = next_link
 
         return devices
 
     @staticmethod
     def _normalize(raw: dict) -> EndpointTelemetry | None:
-        """Convert a raw Graph managedDevice record to EndpointTelemetry."""
-        # Graph reports the last known public IP in several possible fields
-        public_ip = (
-            raw.get("wiFiMacAddress")  # fallback; real field below
-            or raw.get("lastSyncDateTime")  # placeholder — use actual IP field
-        )
-        # The actual IP field in Graph is not always populated; use managementState
-        # as a health proxy and lastSyncDateTime as timestamp.
-        # The real IP comes from compliantAndNotAbleToAccessEmail / publicIpAddress
-        # (available in some Graph beta endpoints); for v1.0 we use wiFiMacAddress
-        # as a best-effort proxy or fall back to a sentinel.
-        #
-        # NOTE: In production use Graph Beta endpoint which exposes publicIpAddress.
-        # For this PoC the field name is "publicIpAddress" in the beta response.
-        public_ip = raw.get("publicIpAddress") or raw.get("wiFiMacAddress")
-        if not public_ip:
+        """Convert a managedDevice with an explicit public IP to telemetry.
+
+        A MAC address identifies a network interface, not an IP address. Devices
+        without ``publicIpAddress`` cannot participate in IP correlation.
+        """
+        if not isinstance(raw, dict):
+            raise CollectorError("Intune normalization error: invalid managed device record")
+        device_id = raw.get("id")
+        if device_id is None or (isinstance(device_id, str) and not device_id.strip()):
             return None
+        if not isinstance(device_id, str):
+            raise CollectorError("Intune normalization error: invalid device id")
+        public_ip = raw.get("publicIpAddress")
+        if public_ip is None or (isinstance(public_ip, str) and not public_ip.strip()):
+            return None
+
+        if not isinstance(public_ip, str):
+            raise CollectorError("Intune normalization error: invalid publicIpAddress")
+
+        try:
+            parsed_ip = ip_address(public_ip.strip())
+        except ValueError:
+            raise CollectorError("Intune normalization error: invalid publicIpAddress") from None
+
         try:
             return EndpointTelemetry(
-                device_id=raw.get("id", ""),
+                device_id=device_id.strip(),
                 hostname=raw.get("deviceName", ""),
-                public_ip=public_ip,
+                public_ip=parsed_ip,
                 source="intune",
                 timestamp=raw.get("lastSyncDateTime", ""),
                 health_status=raw.get("complianceState"),
                 raw_data=raw,
             )
-        except Exception as exc:
-            raise CollectorError(f"Intune normalization error: {exc}") from exc
+        except Exception:
+            raise CollectorError(
+                "Intune normalization error: invalid managed device record"
+            ) from None
 
     # ------------------------------------------------------------------
     # BaseCollector interface
@@ -131,6 +151,7 @@ class IntuneCollector(BaseCollector[EndpointTelemetry]):
 
         Uses MockDataGenerator when config.mock_mode is True.
         """
+        self.skipped_count = 0
         if self.config.mock_mode:
             return MockDataGenerator().generate_endpoint_telemetry("intune")
 
@@ -143,7 +164,18 @@ class IntuneCollector(BaseCollector[EndpointTelemetry]):
 
         results: list[EndpointTelemetry] = []
         for raw in raw_devices:
-            record = self._normalize(raw)
+            try:
+                record = self._normalize(raw)
+            except CollectorError:
+                self.skipped_count += 1
+                continue
             if record is not None:
                 results.append(record)
+            else:
+                self.skipped_count += 1
+        if self.skipped_count:
+            logger.warning(
+                "Intune skipped %d managed device(s) with missing or invalid data",
+                self.skipped_count,
+            )
         return results

@@ -18,10 +18,13 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.pool import StaticPool
 
+from debacl.api import app as api_module
 from debacl.api.app import app, get_engine_dep
+from debacl.config import get_settings
 from debacl.models.events import ConnectionEvent
 from debacl.models.findings import Finding
 from debacl.models.telemetry import EndpointTelemetry
+from debacl.normalization import as_utc
 from debacl.storage.database import init_db
 from debacl.storage.repository import EventRepository, FindingRepository, TelemetryRepository
 
@@ -30,6 +33,14 @@ from debacl.storage.repository import EventRepository, FindingRepository, Teleme
 # ---------------------------------------------------------------------------
 
 NOW_UTC = datetime(2026, 3, 5, 12, 0, 0, tzinfo=UTC)
+
+
+def test_as_utc_treats_naive_timestamp_as_utc():
+    assert as_utc(datetime(2026, 3, 5, 12)) == NOW_UTC
+
+
+def test_as_utc_converts_offset_timestamp_to_utc():
+    assert as_utc(datetime.fromisoformat("2026-03-05T13:00:00+01:00")) == NOW_UTC
 
 
 def make_in_memory_engine():
@@ -224,6 +235,21 @@ class TestTelemetry:
         assert resp.status_code == 200
         assert resp.json() == []
 
+    @pytest.mark.parametrize(
+        ("since", "expected_count"),
+        [
+            ("2026-03-05T13:00:00+02:00", 1),
+            ("2026-03-05T07:00:00-05:00", 1),
+            ("2026-03-05T12:00:00", 1),
+            ("2026-03-05T13:00:00+00:00", 0),
+        ],
+    )
+    def test_since_compares_utc_instants(self, client_with_data, since, expected_count):
+        client, _ = client_with_data
+        resp = client.get("/telemetry", params={"since": since})
+        assert resp.status_code == 200
+        assert len(resp.json()) == expected_count
+
 
 # ---------------------------------------------------------------------------
 # /events
@@ -250,6 +276,40 @@ class TestEvents:
         resp = client_empty.get("/events")
         assert resp.status_code == 200
         assert resp.json() == []
+
+    @pytest.mark.parametrize(
+        ("since", "expected_count"),
+        [
+            ("2026-03-05T13:00:00+02:00", 1),
+            ("2026-03-05T07:00:00-05:00", 1),
+            ("2026-03-05T12:00:00", 1),
+            ("2026-03-05T13:00:00+00:00", 0),
+        ],
+    )
+    def test_since_compares_utc_instants(self, client_with_data, since, expected_count):
+        client, _ = client_with_data
+        resp = client.get("/events", params={"since": since})
+        assert resp.status_code == 200
+        assert len(resp.json()) == expected_count
+
+
+def test_api_uses_configured_database_path(tmp_path, monkeypatch):
+    db_path = tmp_path / "shared.db"
+    monkeypatch.setenv("DEBACL_DB_PATH", str(db_path))
+    get_settings.cache_clear()
+    monkeypatch.setattr(api_module, "_DEFAULT_ENGINE", None)
+
+    engine = get_engine_dep()
+    try:
+        EventRepository(engine).save(make_event())
+        with TestClient(app) as client:
+            resp = client.get("/events")
+        assert resp.status_code == 200
+        assert len(resp.json()) == 1
+        assert db_path.exists()
+    finally:
+        engine.dispose()
+        get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------
